@@ -31,3 +31,7 @@ jobs:
 
       - name: Check command help
         run: python keep_awake.py --help
+
+      - name: Smoke test Windows API wrapper in dry-run mode
+        if: runner.os == 'Windows'
+        run: python keep_awake.py --hours 00:00-00:00 --dry-run --once --no-sleep-prevention --verbose
