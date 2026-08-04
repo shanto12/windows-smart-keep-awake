@@ -1,15 +1,18 @@
 # Windows Smart Keep Awake
 
-A single-file, dependency-free Python utility for Windows that keeps the machine awake during a local-time window while minimizing interference with normal work.
+A single-file, dependency-free Python utility for Windows that keeps the machine awake — and Microsoft Teams showing **Available** — during a local-time window, while minimizing interference with normal work.
 
 The default behavior is:
 
 - active from **08:00 through 18:00 local time**;
-- use Windows APIs to prevent system sleep during that window;
-- read the visible Windows inactivity settings when possible;
-- send one rare **F24 key down/up pair** only when the idle time is within 30 seconds of the detected timeout;
-- check at most every 15 seconds and wait at the schedule boundary when outside the window;
-- never inject input while the user is actively working, because the pulse is only considered after the idle threshold is reached.
+- prevent system sleep and keep the display on with `SetThreadExecutionState` during that window;
+- send one rare **F24 key down/up pair** whenever the machine has been idle for **4 minutes**;
+- print a startup banner, a **dot every 5 minutes** so you can see it is still running, and a **`*`** each time a pulse is sent;
+- never inject input while you are actively working — a pulse is only considered once the idle threshold is reached.
+
+## Why this keeps Teams green
+
+Teams marks you *Away* after about 5 minutes without keyboard or mouse input. It reads the same Windows last-input timer that controls screen lock and idle sleep. The synthetic F24 pulse resets that timer, so pulsing at 4 minutes of idle keeps Teams on *Available*, keeps the screen unlocked, and keeps the machine awake — one mechanism covers all three. F24 is a non-text key that regular applications ignore, so it does not type characters or move the pointer.
 
 ## Run it
 
@@ -19,34 +22,40 @@ On the Windows laptop, with Python 3 installed:
 py keep_awake.py
 ```
 
+You should immediately see something like:
+
+```
+windows-smart-keep-awake v2.0.0
+active window 08:00-18:00 local time; f24 pulse when idle >= 240s
+output: '.' every 300s means still running, '*' means pulse sent
+press Ctrl+C to stop
+[2026-08-04 09:12:03] inside active window 08:00-18:00: keeping Windows awake and Teams available
+..*..*.
+```
+
 Useful overrides:
 
 ```powershell
 # Preview decisions without changing power state or sending input.
-py keep_awake.py --dry-run --verbose
+py keep_awake.py --dry-run
 
 # Use a one-pixel relative mouse nudge instead of F24.
 py keep_awake.py --input mouse
 
-# Set an explicit 15-minute lock timeout and use a 45-second lead.
-py keep_awake.py --lock-after 900 --wake-before 45
+# Pulse earlier (every 3 minutes of idle) and print a dot every minute.
+py keep_awake.py --max-idle 180 --heartbeat 60
 
-# Use a different local-time window.
+# Use a different local-time window (overnight windows work too).
 py keep_awake.py --hours 07:30-19:00
-
-# Only prevent sleep; do not synthesize keyboard or mouse input.
-py keep_awake.py --input none
 ```
 
 Press `Ctrl+C` to stop. The script clears its Windows power request on exit.
 
 ## Why it is conservative
 
-The runner is intentionally a single loop with no third-party packages. It uses `GetLastInputInfo` for the real Windows idle duration, monotonic time for cooldowns, and local wall-clock time only for the daily schedule. It sleeps until the next relevant check, so it does not busy-wait.
+The runner is intentionally a single loop with no third-party packages. It uses `GetLastInputInfo` for the real Windows idle duration, monotonic time for pacing, and local wall-clock time only for the daily schedule. It sleeps between checks (30 seconds by default inside the window), so it does not busy-wait, and outside the window it waits quietly for the next start time while still printing its heartbeat.
 
-F24 is used by default because it is a non-text virtual key and does not move the pointer. Applications can still choose to handle any synthetic input, so `--input mouse` and `--input none` are available. Use this only on a device you own or are authorized to manage, and only where it is consistent with your organization’s security policy. It does not override a centrally enforced lock policy.
-
-`SetThreadExecutionState` prevents ordinary system sleep while the schedule is active. It does not guarantee that Windows will ignore a managed inactivity lock. Auto-detection covers visible screen-saver and machine inactivity settings; use `--lock-after SECONDS` when your environment has a hidden or centrally managed timeout.
+Use this only on a device you own or are authorized to manage, and only where it is consistent with your organization's security policy. It does not override a centrally enforced lock policy.
 
 ## Tests
 
