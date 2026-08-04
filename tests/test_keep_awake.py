@@ -35,10 +35,6 @@ class ParseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             keep_awake.parse_seconds("0")
 
-    def test_lock_after_auto(self):
-        self.assertIsNone(keep_awake.parse_lock_after("auto"))
-        self.assertEqual(keep_awake.parse_lock_after("900"), 900.0)
-
 
 class ScheduleTests(unittest.TestCase):
     def test_regular_window_is_start_inclusive_and_end_exclusive(self):
@@ -64,36 +60,28 @@ class ScheduleTests(unittest.TestCase):
 
 
 class DecisionTests(unittest.TestCase):
-    def test_pulse_starts_at_lead_threshold(self):
-        self.assertFalse(
-            keep_awake.should_pulse(True, 569, 600, 30, 100, None, 180)
-        )
-        self.assertTrue(
-            keep_awake.should_pulse(True, 570, 600, 30, 100, None, 180)
-        )
+    def test_pulse_starts_at_max_idle(self):
+        self.assertFalse(keep_awake.should_pulse(True, 239, 240, 100, None))
+        self.assertTrue(keep_awake.should_pulse(True, 240, 240, 100, None))
 
-    def test_pulse_respects_schedule_and_cooldown(self):
-        self.assertFalse(
-            keep_awake.should_pulse(False, 900, 600, 30, 100, None, 180)
-        )
-        self.assertFalse(
-            keep_awake.should_pulse(True, 900, 600, 30, 200, 100, 180)
-        )
-        self.assertTrue(
-            keep_awake.should_pulse(True, 900, 600, 30, 281, 100, 180)
-        )
+    def test_pulse_respects_schedule(self):
+        self.assertFalse(keep_awake.should_pulse(False, 900, 240, 100, None))
+
+    def test_pulse_rate_is_limited_when_idle_never_resets(self):
+        self.assertFalse(keep_awake.should_pulse(True, 900, 240, 300, 100))
+        self.assertTrue(keep_awake.should_pulse(True, 900, 240, 341, 100))
 
 
 class RunnerTests(unittest.TestCase):
     def setUp(self):
         self.now_value = dt.datetime(2026, 7, 30, 10, 0)
         self.monotonic_value = 100.0
-        self.platform = FakePlatform(idle_seconds=570)
+        self.platform = FakePlatform(idle_seconds=240)
+        self.output = []
         settings = keep_awake.Settings(
             schedule=keep_awake.Schedule(dt.time(8), dt.time(18)),
-            lock_after_seconds=600,
-            wake_before_seconds=30,
-            cooldown_seconds=180,
+            max_idle_seconds=240,
+            heartbeat_seconds=300,
             input_mode="f24",
         )
         self.runner = keep_awake.KeepAwakeRunner(
@@ -101,14 +89,21 @@ class RunnerTests(unittest.TestCase):
             self.platform,
             now=lambda: self.now_value,
             monotonic=lambda: self.monotonic_value,
+            echo=self.output.append,
         )
 
     def test_inside_window_enables_power_keep_awake_and_pulses(self):
         scheduled, idle = self.runner.step()
         self.assertTrue(scheduled)
-        self.assertEqual(idle, 570)
+        self.assertEqual(idle, 240)
         self.assertEqual(self.platform.keep_awake_calls, [True])
         self.assertEqual(self.platform.pulses, ["f24"])
+        self.assertIn("*", self.output)
+
+    def test_below_max_idle_does_not_pulse(self):
+        self.platform.idle_seconds = 239
+        self.runner.step()
+        self.assertEqual(self.platform.pulses, [])
 
     def test_outside_window_disables_power_keep_awake(self):
         self.runner.step()
@@ -121,13 +116,29 @@ class RunnerTests(unittest.TestCase):
     def test_dry_run_does_not_touch_platform(self):
         self.runner.settings = keep_awake.Settings(
             schedule=self.runner.settings.schedule,
-            lock_after_seconds=600,
+            max_idle_seconds=240,
             input_mode="f24",
             dry_run=True,
         )
         self.runner.step()
         self.assertEqual(self.platform.keep_awake_calls, [])
         self.assertEqual(self.platform.pulses, [])
+
+    def test_run_emits_heartbeat_dot(self):
+        self.platform.idle_seconds = 0
+        sleeps = []
+
+        def fake_sleep(delay):
+            sleeps.append(delay)
+            self.monotonic_value += 400
+            if len(sleeps) >= 2:
+                raise KeyboardInterrupt
+
+        self.runner.sleep = fake_sleep
+        with self.assertRaises(KeyboardInterrupt):
+            self.runner.run()
+        self.assertIn(".", self.output)
+        self.assertEqual(self.platform.keep_awake_calls, [True, False])
 
 
 if __name__ == "__main__":

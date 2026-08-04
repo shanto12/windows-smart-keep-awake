@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Minimal, idle-aware Windows keep-awake utility.
+"""Minimal Windows keep-awake utility that also keeps MS Teams active.
 
-The program stays inside a configured local-time window (08:00-18:00 by
-default), prevents system sleep while that window is active, and sends a
-rare, non-text F24 key pulse only when the detected/configured inactivity
-timeout is close.  It is intentionally Windows-only and dependency-free.
+Inside a configured local-time window (08:00-18:00 by default) the program
+prevents system sleep, keeps the display on, and sends a rare, non-text F24
+key pulse whenever the machine has been idle for --max-idle seconds.  The
+pulse resets Windows' last-input timer -- the same timer Microsoft Teams
+uses for presence -- so pulsing before Teams' five-minute away threshold
+keeps the status "Available".  Console output is always on: a dot every
+--heartbeat seconds shows the script is alive, a star marks each pulse.
+
+It is intentionally Windows-only and dependency-free.
 """
 
 from __future__ import annotations
@@ -12,7 +17,6 @@ from __future__ import annotations
 import argparse
 import ctypes
 import datetime as dt
-import logging
 import os
 import sys
 import time
@@ -20,14 +24,12 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
 
-LOGGER = logging.getLogger("keep_awake")
-
 DEFAULT_HOURS = "08:00-18:00"
-DEFAULT_LOCK_AFTER_SECONDS = 600.0
-DEFAULT_WAKE_BEFORE_SECONDS = 30.0
-DEFAULT_POLL_SECONDS = 15.0
-DEFAULT_COOLDOWN_SECONDS = 180.0
+DEFAULT_MAX_IDLE_SECONDS = 240.0  # pulse before Teams' 5-minute away timer
+DEFAULT_POLL_SECONDS = 30.0
+DEFAULT_HEARTBEAT_SECONDS = 300.0
 DEFAULT_INPUT_MODE = "f24"
+VERSION = "2.0.0"
 
 KEYEVENTF_KEYUP = 0x0002
 INPUT_MOUSE = 0
@@ -37,10 +39,7 @@ VK_F24 = 0x87
 
 ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001
-
-SPI_GETSCREENSAVETIMEOUT = 14
-SPI_GETSCREENSAVEACTIVE = 16
-SPI_GETSCREENSAVESECURE = 0x0076
+ES_DISPLAY_REQUIRED = 0x00000002
 
 
 def parse_clock(value: str) -> dt.time:
@@ -77,22 +76,6 @@ def parse_seconds(value: str) -> float:
     return seconds
 
 
-def parse_nonnegative_seconds(value: str) -> float:
-    try:
-        seconds = float(value)
-    except (TypeError, ValueError):
-        raise ValueError("seconds must be a number")
-    if seconds < 0:
-        raise ValueError("seconds cannot be negative")
-    return seconds
-
-
-def parse_lock_after(value: str) -> Optional[float]:
-    if value.strip().lower() == "auto":
-        return None
-    return parse_seconds(value)
-
-
 @dataclass(frozen=True)
 class Schedule:
     """A daily local-time window; overnight windows are supported."""
@@ -120,33 +103,32 @@ class Schedule:
 @dataclass(frozen=True)
 class Settings:
     schedule: Schedule
-    lock_after_seconds: float
-    wake_before_seconds: float = DEFAULT_WAKE_BEFORE_SECONDS
+    max_idle_seconds: float = DEFAULT_MAX_IDLE_SECONDS
     poll_seconds: float = DEFAULT_POLL_SECONDS
-    cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS
+    heartbeat_seconds: float = DEFAULT_HEARTBEAT_SECONDS
     input_mode: str = DEFAULT_INPUT_MODE
-    prevent_sleep: bool = True
     dry_run: bool = False
 
 
 def should_pulse(
     scheduled: bool,
     idle_seconds: float,
-    lock_after_seconds: float,
-    wake_before_seconds: float,
+    max_idle_seconds: float,
     monotonic_now: float,
     last_pulse_monotonic: Optional[float],
-    cooldown_seconds: float,
 ) -> bool:
-    """Return True only when the idle timeout is close and cooldown allows it."""
+    """Pulse only inside the window, once idle reaches the limit.
+
+    The elapsed-time guard keeps --input none and --dry-run from firing on
+    every poll, since those modes never reset the system idle timer.
+    """
 
     if not scheduled:
         return False
-    threshold = max(0.0, lock_after_seconds - wake_before_seconds)
-    if idle_seconds < threshold:
+    if idle_seconds < max_idle_seconds:
         return False
     if last_pulse_monotonic is not None:
-        if monotonic_now - last_pulse_monotonic < cooldown_seconds:
+        if monotonic_now - last_pulse_monotonic < max_idle_seconds:
             return False
     return True
 
@@ -228,14 +210,6 @@ class WindowsPlatform:
         self.user32.GetCursorPos.argtypes = [ctypes.POINTER(_POINT)]
         self.user32.GetCursorPos.restype = ctypes.c_bool
 
-        self.user32.SystemParametersInfoW.argtypes = [
-            ctypes.c_uint32,
-            ctypes.c_uint32,
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-        ]
-        self.user32.SystemParametersInfoW.restype = ctypes.c_bool
-
     @staticmethod
     def _raise_last_error(operation: str) -> None:
         error = ctypes.get_last_error()
@@ -252,79 +226,10 @@ class WindowsPlatform:
         elapsed_ms = (current_tick - int(info.dwTime)) & 0xFFFFFFFF
         return elapsed_ms / 1000.0
 
-    def _system_parameter_bool(self, action: int) -> Optional[bool]:
-        value = ctypes.c_int(0)
-        if self.user32.SystemParametersInfoW(
-            action, 0, ctypes.byref(value), 0
-        ):
-            return bool(value.value)
-        return None
-
-    def detect_lock_timeout(self) -> Tuple[float, str]:
-        """Find the most conservative visible inactivity timeout.
-
-        Windows policy can be managed centrally or hidden from a normal user.
-        If no visible timeout is available, the documented fallback is ten
-        minutes; users can always override it with --lock-after SECONDS.
-        """
-
-        candidates = []
-        screen_saver_timeout = ctypes.c_uint32(0)
-        screen_saver_active = self._system_parameter_bool(SPI_GETSCREENSAVEACTIVE)
-        screen_saver_secure = self._system_parameter_bool(SPI_GETSCREENSAVESECURE)
-        if self.user32.SystemParametersInfoW(
-            SPI_GETSCREENSAVETIMEOUT,
-            0,
-            ctypes.byref(screen_saver_timeout),
-            0,
-        ):
-            secure_from_registry = False
-            try:
-                import winreg
-
-                with winreg.OpenKey(
-                    winreg.HKEY_CURRENT_USER, r"Control Panel\Desktop"
-                ) as key:
-                    secure_from_registry = str(
-                        winreg.QueryValueEx(key, "ScreenSaveIsSecure")[0]
-                    ) == "1"
-            except (OSError, ImportError):
-                pass
-            if (
-                screen_saver_timeout.value > 0
-                and screen_saver_active
-                and (screen_saver_secure or secure_from_registry)
-            ):
-                candidates.append(
-                    (float(screen_saver_timeout.value), "Windows screen saver")
-                )
-
-        try:
-            import winreg
-
-            with winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE,
-                r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
-            ) as key:
-                policy_seconds = int(
-                    winreg.QueryValueEx(key, "InactivityTimeoutSecs")[0]
-                )
-                if policy_seconds > 0:
-                    candidates.append(
-                        (float(policy_seconds), "Windows inactivity policy")
-                    )
-        except (OSError, ImportError, TypeError, ValueError):
-            pass
-
-        if candidates:
-            timeout, source = min(candidates, key=lambda candidate: candidate[0])
-            return timeout, source
-        return DEFAULT_LOCK_AFTER_SECONDS, "fallback (10 minutes)"
-
     def set_keep_awake(self, enabled: bool) -> None:
         flags = ES_CONTINUOUS
         if enabled:
-            flags |= ES_SYSTEM_REQUIRED
+            flags |= ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
         if not self.kernel32.SetThreadExecutionState(flags):
             self._raise_last_error("SetThreadExecutionState")
 
@@ -393,6 +298,10 @@ class WindowsPlatform:
             raise ValueError("unknown input mode: %s" % mode)
 
 
+def _print_echo(text: str) -> None:
+    print(text, end="", flush=True)
+
+
 class KeepAwakeRunner:
     """Run the schedule with injectable clocks so decisions are testable."""
 
@@ -403,25 +312,48 @@ class KeepAwakeRunner:
         now: Optional[Callable[[], dt.datetime]] = None,
         monotonic: Optional[Callable[[], float]] = None,
         sleep: Optional[Callable[[float], None]] = None,
+        echo: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.settings = settings
         self.platform = platform
         self.now = now or dt.datetime.now
         self.monotonic = monotonic or time.monotonic
         self.sleep = sleep or time.sleep
+        self.echo = echo if echo is not None else _print_echo
         self.last_pulse_monotonic = None  # type: Optional[float]
+        self.last_heartbeat_monotonic = None  # type: Optional[float]
         self.awake_enabled = False
         self.last_scheduled = None  # type: Optional[bool]
+        self._mid_line = False
+
+    def _status(self, message: str) -> None:
+        prefix = "\n" if self._mid_line else ""
+        stamp = self.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.echo("%s[%s] %s\n" % (prefix, stamp, message))
+        self._mid_line = False
+
+    def _tick(self, mark: str) -> None:
+        self.echo(mark)
+        self._mid_line = True
 
     def step(self) -> Tuple[bool, Optional[float]]:
         current = self.now()
         scheduled = self.settings.schedule.contains(current)
         if scheduled != self.last_scheduled:
-            LOGGER.info(
-                "%s schedule window at %s",
-                "inside" if scheduled else "outside",
-                current.strftime("%Y-%m-%d %H:%M:%S"),
-            )
+            if scheduled:
+                self._status(
+                    "inside active window %s-%s: keeping Windows awake and "
+                    "Teams available"
+                    % (
+                        self.settings.schedule.start.strftime("%H:%M"),
+                        self.settings.schedule.end.strftime("%H:%M"),
+                    )
+                )
+            else:
+                self._status(
+                    "outside active window: not intervening until %s"
+                    % self.settings.schedule.start.strftime("%H:%M")
+                )
             self.last_scheduled = scheduled
 
         if not scheduled:
@@ -430,68 +362,69 @@ class KeepAwakeRunner:
                 self.awake_enabled = False
             return False, None
 
-        if self.settings.prevent_sleep and not self.settings.dry_run:
-            if not self.awake_enabled:
-                self.platform.set_keep_awake(True)
-                self.awake_enabled = True
+        if not self.settings.dry_run and not self.awake_enabled:
+            self.platform.set_keep_awake(True)
+            self.awake_enabled = True
 
         idle_seconds = self.platform.get_idle_seconds()
         now_monotonic = self.monotonic()
         if should_pulse(
             scheduled=True,
             idle_seconds=idle_seconds,
-            lock_after_seconds=self.settings.lock_after_seconds,
-            wake_before_seconds=self.settings.wake_before_seconds,
+            max_idle_seconds=self.settings.max_idle_seconds,
             monotonic_now=now_monotonic,
             last_pulse_monotonic=self.last_pulse_monotonic,
-            cooldown_seconds=self.settings.cooldown_seconds,
         ):
             if self.settings.input_mode != "none" and not self.settings.dry_run:
                 self.platform.pulse(self.settings.input_mode)
             self.last_pulse_monotonic = now_monotonic
-            LOGGER.info(
-                "%s idle pulse at %.1fs idle (mode=%s)",
-                "would send" if self.settings.dry_run else "sent",
-                idle_seconds,
-                self.settings.input_mode,
-            )
+            self._tick("*")
         return True, idle_seconds
 
     def run(self, once: bool = False) -> None:
         try:
             while True:
-                scheduled, idle_seconds = self.step()
+                scheduled, _ = self.step()
                 if once:
                     return
 
-                current = self.now()
-                if not scheduled:
+                now_monotonic = self.monotonic()
+                if self.last_heartbeat_monotonic is None:
+                    self.last_heartbeat_monotonic = now_monotonic
+                elif (
+                    now_monotonic - self.last_heartbeat_monotonic
+                    >= self.settings.heartbeat_seconds
+                ):
+                    self._tick(".")
+                    self.last_heartbeat_monotonic = now_monotonic
+
+                if scheduled:
+                    delay = self.settings.poll_seconds
+                else:
                     delay = min(
                         3600.0,
-                        max(0.5, self.settings.schedule.seconds_until_start(current)),
+                        max(
+                            0.5,
+                            self.settings.schedule.seconds_until_start(self.now()),
+                        ),
                     )
-                else:
-                    delay = self.settings.poll_seconds
-                    if idle_seconds is not None:
-                        until_threshold = (
-                            self.settings.lock_after_seconds
-                            - self.settings.wake_before_seconds
-                            - idle_seconds
-                        )
-                        if until_threshold > 0:
-                            delay = min(delay, max(0.5, until_threshold))
+                until_heartbeat = self.settings.heartbeat_seconds - (
+                    now_monotonic - self.last_heartbeat_monotonic
+                )
+                delay = min(delay, max(0.5, until_heartbeat))
                 self.sleep(delay)
         finally:
             if self.awake_enabled:
                 self.platform.set_keep_awake(False)
                 self.awake_enabled = False
+                self._status("released keep-awake state")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Keep a Windows PC awake during a local-time window with "
-            "minimal, idle-aware input."
+            "Keep a Windows PC awake and MS Teams available during a "
+            "local-time window, using minimal idle-aware input."
         )
     )
     parser.add_argument(
@@ -501,31 +434,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="local daily window, default: %(default)s",
     )
     parser.add_argument(
-        "--lock-after",
-        default="auto",
-        metavar="SECONDS|auto",
-        help="inactivity timeout; auto-detect or override it explicitly",
-    )
-    parser.add_argument(
-        "--wake-before",
-        type=parse_nonnegative_seconds,
-        default=DEFAULT_WAKE_BEFORE_SECONDS,
+        "--max-idle",
+        type=parse_seconds,
+        default=DEFAULT_MAX_IDLE_SECONDS,
         metavar="SECONDS",
-        help="pulse this many seconds before the timeout, default: %(default)s",
+        help=(
+            "pulse when idle reaches this many seconds; keep it under 300 "
+            "so Teams never goes away, default: %(default)s"
+        ),
     )
     parser.add_argument(
         "--poll",
         type=parse_seconds,
         default=DEFAULT_POLL_SECONDS,
         metavar="SECONDS",
-        help="maximum idle check interval, default: %(default)s",
+        help="idle check interval, default: %(default)s",
     )
     parser.add_argument(
-        "--cooldown",
-        type=parse_nonnegative_seconds,
-        default=DEFAULT_COOLDOWN_SECONDS,
+        "--heartbeat",
+        type=parse_seconds,
+        default=DEFAULT_HEARTBEAT_SECONDS,
         metavar="SECONDS",
-        help="minimum time between pulses, default: %(default)s",
+        help="print a liveness dot this often, default: %(default)s",
     )
     parser.add_argument(
         "--input",
@@ -534,85 +464,68 @@ def build_parser() -> argparse.ArgumentParser:
         help="input pulse: rare F24 key, one-pixel mouse nudge, or none",
     )
     parser.add_argument(
-        "--no-sleep-prevention",
-        action="store_true",
-        help="do not call SetThreadExecutionState during the active window",
-    )
-    parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="log decisions without changing power state or sending input",
+        help="print decisions without changing power state or sending input",
     )
     parser.add_argument(
         "--once",
         action="store_true",
         help="evaluate one iteration and exit",
     )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="enable informational logging",
-    )
-    parser.add_argument("--version", action="version", version="1.0.0")
+    parser.add_argument("--version", action="version", version=VERSION)
     return parser
-
-
-def configure_logging(verbose: bool) -> None:
-    logging.basicConfig(
-        level=logging.INFO if verbose else logging.WARNING,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
 
 
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    configure_logging(args.verbose)
 
     try:
         schedule = parse_hours(args.hours)
-        lock_after = parse_lock_after(args.lock_after)
     except ValueError as error:
         parser.error(str(error))
 
     if os.name != "nt":
         parser.error("this utility must be run on Windows")
 
-    platform = WindowsPlatform()
-    if lock_after is None:
-        lock_after, source = platform.detect_lock_timeout()
-        LOGGER.info("using %.0fs timeout from %s", lock_after, source)
-    else:
-        source = "command-line override"
-        LOGGER.info("using %.0fs timeout from %s", lock_after, source)
-
     settings = Settings(
         schedule=schedule,
-        lock_after_seconds=lock_after,
-        wake_before_seconds=args.wake_before,
+        max_idle_seconds=args.max_idle,
         poll_seconds=args.poll,
-        cooldown_seconds=args.cooldown,
+        heartbeat_seconds=args.heartbeat,
         input_mode=args.input,
-        prevent_sleep=not args.no_sleep_prevention,
         dry_run=args.dry_run,
     )
-    LOGGER.info(
-        "active from %s to %s; input=%s; sleep-prevention=%s; dry-run=%s",
-        schedule.start.strftime("%H:%M"),
-        schedule.end.strftime("%H:%M"),
-        settings.input_mode,
-        settings.prevent_sleep and not settings.dry_run,
-        settings.dry_run,
-    )
 
+    print("windows-smart-keep-awake v%s" % VERSION, flush=True)
+    print(
+        "active window %s-%s local time; %s pulse when idle >= %.0fs"
+        % (
+            schedule.start.strftime("%H:%M"),
+            schedule.end.strftime("%H:%M"),
+            settings.input_mode,
+            settings.max_idle_seconds,
+        ),
+        flush=True,
+    )
+    print(
+        "output: '.' every %.0fs means still running, '*' means pulse sent"
+        % settings.heartbeat_seconds,
+        flush=True,
+    )
+    if settings.dry_run:
+        print("dry-run: no power state change, no input sent", flush=True)
+    print("press Ctrl+C to stop", flush=True)
+
+    platform = WindowsPlatform()
     runner = KeepAwakeRunner(settings, platform)
     try:
         runner.run(once=args.once)
     except KeyboardInterrupt:
-        LOGGER.info("stopped")
+        print("\nstopped", flush=True)
     except OSError as error:
-        LOGGER.error("Windows API error: %s", error)
+        print("\nWindows API error: %s" % error, file=sys.stderr, flush=True)
         return 1
     return 0
 
