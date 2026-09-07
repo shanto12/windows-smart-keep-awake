@@ -5,6 +5,7 @@ All Windows APIs are replaced with fakes; these tests never synthesize input.
 """
 
 import ctypes
+import datetime as dt
 import unittest
 from unittest.mock import Mock, patch
 
@@ -63,6 +64,7 @@ class FakePlatform:
         self.accept_pulse = True
         self.reset_on_pulse = True
         self.pulse_times = []
+        self.pulse_modes = []
         self.settings = awake.IdleSettings()
 
     def read_idle_settings(self):
@@ -84,9 +86,10 @@ class FakePlatform:
         self.calls.append("keys")
         return self.keys
 
-    def send_idle_pulse(self, minimum_idle_seconds=0.0):
+    def send_idle_pulse(self, minimum_idle_seconds=0.0, mode="f24"):
         self.calls.append("pulse")
         self.pulse_times.append(self.clock.now)
+        self.pulse_modes.append(mode)
         if self.accept_pulse and self.reset_on_pulse:
             self.user_input()
         return self.accept_pulse
@@ -99,6 +102,7 @@ class FakePlatform:
 def make_runner(platform=None, clock=None, **kwargs):
     clock = clock or FakeClock()
     platform = platform or FakePlatform(clock)
+    kwargs.setdefault("now_utc", lambda: dt.datetime(2026, 9, 6, 17, tzinfo=dt.timezone.utc))
     return awake.KeepAwakeRunner(
         platform=platform,
         monotonic=clock.monotonic,
@@ -325,6 +329,192 @@ class TimeoutSelectionTests(RuntimeTestCase):
         self.assertEqual(awake.choose_idle_seconds(45, settings), 45)
 
 
+class WorkScheduleTests(RuntimeTestCase):
+    def test_central_weekday_start_is_inclusive_and_end_is_exclusive(self):
+        for hour, minute, second, active in (
+            (12, 59, 59, False),
+            (13, 0, 0, True),
+            (22, 59, 59, True),
+            (23, 0, 0, False),
+        ):
+            with self.subTest(hour=hour, minute=minute, second=second):
+                instant = dt.datetime(2026, 9, 14, hour, minute, second, tzinfo=dt.timezone.utc)
+                self.assertEqual(awake.work_period(instant)[0], active)
+
+    def test_winter_work_start_uses_cst_instead_of_fixed_summer_offset(self):
+        self.assertFalse(
+            awake.work_period(dt.datetime(2026, 1, 13, 13, 59, tzinfo=dt.timezone.utc))[0]
+        )
+        self.assertTrue(awake.work_period(dt.datetime(2026, 1, 13, 14, tzinfo=dt.timezone.utc))[0])
+
+    def test_aware_input_zone_does_not_change_central_schedule(self):
+        utc = dt.datetime(2026, 9, 14, 13, tzinfo=dt.timezone.utc)
+        elsewhere = utc.astimezone(dt.timezone(dt.timedelta(hours=9)))
+        self.assertEqual(awake.central_time(utc), awake.central_time(elsewhere))
+        self.assertEqual(awake.work_period(utc), awake.work_period(elsewhere))
+        self.assertEqual(awake.central_time(elsewhere).hour, 8)
+
+    def test_spring_dst_transition_skips_two_am(self):
+        before = awake.central_time(dt.datetime(2026, 3, 8, 7, 59, 59, tzinfo=dt.timezone.utc))
+        after = awake.central_time(dt.datetime(2026, 3, 8, 8, tzinfo=dt.timezone.utc))
+        self.assertEqual((before.hour, before.minute, before.second), (1, 59, 59))
+        self.assertEqual(before.utcoffset(), dt.timedelta(hours=-6))
+        self.assertEqual((after.hour, after.minute), (3, 0))
+        self.assertEqual(after.utcoffset(), dt.timedelta(hours=-5))
+
+    def test_fall_dst_transition_repeats_one_am_with_standard_offset(self):
+        before = awake.central_time(dt.datetime(2026, 11, 1, 6, 59, 59, tzinfo=dt.timezone.utc))
+        after = awake.central_time(dt.datetime(2026, 11, 1, 7, tzinfo=dt.timezone.utc))
+        self.assertEqual((before.hour, before.minute), (1, 59))
+        self.assertEqual(before.utcoffset(), dt.timedelta(hours=-5))
+        self.assertEqual((after.hour, after.minute), (1, 0))
+        self.assertEqual(after.utcoffset(), dt.timedelta(hours=-6))
+
+    def test_windows_without_zoneinfo_data_preserves_both_dst_boundaries(self):
+        cases = (
+            (dt.datetime(2026, 3, 8, 7, 59, tzinfo=dt.timezone.utc), 1, 59, -6),
+            (dt.datetime(2026, 3, 8, 8, tzinfo=dt.timezone.utc), 3, 0, -5),
+            (dt.datetime(2026, 11, 1, 6, 59, tzinfo=dt.timezone.utc), 1, 59, -5),
+            (dt.datetime(2026, 11, 1, 7, tzinfo=dt.timezone.utc), 1, 0, -6),
+        )
+        with patch.object(awake, "CENTRAL_ZONE", None):
+            for instant, hour, minute, offset in cases:
+                with self.subTest(instant=instant):
+                    local = awake.central_time(instant)
+                    self.assertEqual((local.hour, local.minute), (hour, minute))
+                    self.assertEqual(local.utcoffset(), dt.timedelta(hours=offset))
+            self.assertTrue(
+                awake.work_period(dt.datetime(2026, 1, 13, 14, tzinfo=dt.timezone.utc))[0]
+            )
+            self.assertTrue(
+                awake.work_period(dt.datetime(2026, 9, 14, 13, tzinfo=dt.timezone.utc))[0]
+            )
+
+    def test_texas_calendar_includes_state_dates_and_national_weekday_dates(self):
+        holidays = awake.texas_holidays(2026)
+        for month, day in (
+            (1, 1),
+            (1, 19),
+            (2, 16),
+            (3, 2),
+            (4, 21),
+            (5, 25),
+            (6, 19),
+            (7, 4),
+            (8, 27),
+            (9, 7),
+            (10, 12),
+            (11, 11),
+            (11, 26),
+            (11, 27),
+            (12, 24),
+            (12, 25),
+            (12, 26),
+        ):
+            with self.subTest(month=month, day=day):
+                self.assertIn(dt.date(2026, month, day), holidays)
+                instant = dt.datetime(2026, month, day, 17, tzinfo=dt.timezone.utc)
+                self.assertFalse(awake.work_period(instant)[0])
+
+    def test_federal_holidays_include_observed_dates_but_texas_only_dates_do_not_shift(self):
+        holidays = awake.texas_holidays(2026)
+        self.assertIn(dt.date(2026, 7, 3), holidays)
+        self.assertFalse(awake.work_period(dt.datetime(2026, 7, 3, 17, tzinfo=dt.timezone.utc))[0])
+        self.assertIn(dt.date(2021, 12, 31), awake.texas_holidays(2021))
+        self.assertNotIn(dt.date(2022, 8, 26), awake.texas_holidays(2022))
+        self.assertNotIn(dt.date(2023, 8, 28), awake.texas_holidays(2023))
+        for month, day in ((7, 6), (12, 28)):
+            with self.subTest(month=month, day=day):
+                self.assertNotIn(dt.date(2026, month, day), holidays)
+                self.assertTrue(
+                    awake.work_period(dt.datetime(2026, month, day, 17, tzinfo=dt.timezone.utc))[0]
+                )
+
+    def test_optional_texas_holidays_do_not_disable_default_work_period(self):
+        holidays = awake.texas_holidays(2026)
+        for month, day in ((3, 31), (4, 3)):
+            with self.subTest(month=month, day=day):
+                self.assertNotIn(dt.date(2026, month, day), holidays)
+                self.assertTrue(
+                    awake.work_period(dt.datetime(2026, month, day, 17, tzinfo=dt.timezone.utc))[0]
+                )
+
+    def test_weekends_and_extra_holidays_disable_work_period(self):
+        for day in (12, 13):
+            with self.subTest(day=day):
+                self.assertFalse(
+                    awake.work_period(dt.datetime(2026, 9, day, 17, tzinfo=dt.timezone.utc))[0]
+                )
+        extra = dt.date(2026, 9, 14)
+        instant = dt.datetime(2026, 9, 14, 17, tzinfo=dt.timezone.utc)
+        self.assertTrue(awake.work_period(instant)[0])
+        self.assertFalse(awake.work_period(instant, frozenset({extra}))[0])
+
+
+class ScheduledRunnerTests(RuntimeTestCase):
+    def test_work_period_defaults_to_mouse_input(self):
+        clock = FakeClock()
+        platform = FakePlatform(clock, initial_idle=1000)
+        start = dt.datetime(2026, 9, 14, 17, tzinfo=dt.timezone.utc)
+        make_runner(
+            platform,
+            clock,
+            duration=80,
+            now_utc=lambda: start + dt.timedelta(seconds=clock.now),
+        ).run()
+        self.assertEqual(platform.pulse_modes, ["mouse"] * len(platform.pulse_modes))
+        self.assertGreaterEqual(len(platform.pulse_modes), 2)
+        self.assertEqual(platform.power_calls, [True, False])
+
+    def test_eight_am_transition_changes_input_without_releasing_power(self):
+        clock = FakeClock()
+        platform = FakePlatform(clock, initial_idle=1000)
+        start = dt.datetime(2026, 9, 14, 12, 59, 50, tzinfo=dt.timezone.utc)
+        make_runner(
+            platform,
+            clock,
+            duration=90,
+            now_utc=lambda: start + dt.timedelta(seconds=clock.now),
+        ).run()
+        self.assertEqual(platform.pulse_modes[0], "f24")
+        self.assertIn("mouse", platform.pulse_modes[1:])
+        for when, mode in zip(platform.pulse_times, platform.pulse_modes):
+            self.assertEqual(mode, "f24" if when < 10 else "mouse")
+        self.assertEqual(platform.power_calls, [True, False])
+
+    def test_six_pm_transition_returns_to_idle_guard_without_releasing_power(self):
+        clock = FakeClock()
+        platform = FakePlatform(clock, initial_idle=1000)
+        start = dt.datetime(2026, 9, 14, 22, 59, 50, tzinfo=dt.timezone.utc)
+        make_runner(
+            platform,
+            clock,
+            duration=120,
+            now_utc=lambda: start + dt.timedelta(seconds=clock.now),
+        ).run()
+        self.assertEqual(platform.pulse_modes[0], "mouse")
+        self.assertIn("f24", platform.pulse_modes[1:])
+        for when, mode in zip(platform.pulse_times, platform.pulse_modes):
+            self.assertEqual(mode, "mouse" if when < 10 else "f24")
+        self.assertEqual(platform.power_calls, [True, False])
+
+    def test_weekend_and_holiday_keep_system_and_idle_guard_running(self):
+        for month, day in ((9, 12), (9, 7)):
+            with self.subTest(month=month, day=day):
+                clock = FakeClock()
+                platform = FakePlatform(clock, initial_idle=1000)
+                start = dt.datetime(2026, month, day, 17, tzinfo=dt.timezone.utc)
+                make_runner(
+                    platform,
+                    clock,
+                    duration=100,
+                    now_utc=lambda: start + dt.timedelta(seconds=clock.now),
+                ).run()
+                self.assertTrue(platform.pulse_modes)
+                self.assertEqual(platform.pulse_modes, ["f24"] * len(platform.pulse_modes))
+                self.assertEqual(platform.power_calls, [True, False])
+
+
 class NativeBoundaryTests(RuntimeTestCase):
     def platform(self):
         platform = awake.WindowsPlatform.__new__(awake.WindowsPlatform)
@@ -337,6 +527,19 @@ class NativeBoundaryTests(RuntimeTestCase):
         platform.desktop_available = Mock(return_value=True)
         platform.held_keys = Mock(return_value=False)
         platform.get_input_state = Mock(return_value=awake.InputState(1000, 1000))
+        return platform
+
+    def mouse_platform(self, x=900, y=500):
+        platform = self.pulse_platform()
+
+        def cursor_position(pointer):
+            point = ctypes.cast(pointer, ctypes.POINTER(awake.POINT)).contents
+            point.x, point.y = x, y
+            return 1
+
+        platform.user32.GetCursorPos.side_effect = cursor_position
+        metrics = {76: -1920, 77: 0, 78: 3840, 79: 1080}
+        platform.user32.GetSystemMetrics.side_effect = metrics.__getitem__
         return platform
 
     def test_windows_abi_sizes_and_native_signatures(self):
@@ -510,6 +713,46 @@ class NativeBoundaryTests(RuntimeTestCase):
     def test_partial_insert_release_failure_is_explicit(self):
         platform = self.pulse_platform()
         platform.user32.SendInput.side_effect = [1, 0]
-        with self.assertRaisesRegex(OSError, "F24 release also failed"):
+        with self.assertRaisesRegex(OSError, "(?:F24|f24) .*also failed"):
             platform.send_idle_pulse()
         self.assertEqual(platform.user32.SendInput.call_count, 2)
+
+    def test_work_mouse_pulse_only_moves_and_returns_without_buttons(self):
+        for x in (-1920, 900, 1919):
+            with self.subTest(x=x):
+                platform = self.mouse_platform(x=x)
+
+                def send(count, events, size):
+                    self.assertEqual((count, size), (2, ctypes.sizeof(awake.INPUT)))
+                    self.assertEqual([event.type for event in events], [0, 0])
+                    self.assertEqual([event.mi.dwFlags for event in events], [0xE001, 0xE001])
+                    self.assertEqual([event.mi.mouseData for event in events], [0, 0])
+                    pixels = [
+                        (event.mi.dx * 3840 // 65536 - 1920, event.mi.dy * 1080 // 65536)
+                        for event in events
+                    ]
+                    self.assertEqual(pixels[1], (x, 500))
+                    self.assertEqual(pixels[0], (x + 1 if x < 1919 else x - 1, 500))
+                    return 2
+
+                platform.user32.SendInput.side_effect = send
+                self.assertTrue(platform.send_idle_pulse(45, mode="mouse"))
+                platform.user32.SendInput.assert_called_once()
+
+    def test_work_mouse_pulse_obeys_desktop_key_and_fresh_input_guards(self):
+        for desktop, held, idle in ((False, False, 1000), (True, True, 1000), (True, False, 0)):
+            with self.subTest(desktop=desktop, held=held, idle=idle):
+                platform = self.pulse_platform()
+                platform.desktop_available.return_value = desktop
+                platform.held_keys.return_value = held
+                platform.get_input_state.return_value = awake.InputState(1001, idle)
+                self.assertFalse(platform.send_idle_pulse(45, mode="mouse"))
+                platform.user32.SendInput.assert_not_called()
+
+    def test_partial_mouse_input_failure_does_not_synthesize_keyboard_cleanup(self):
+        platform = self.mouse_platform()
+        platform.user32.SendInput.side_effect = [1, 1]
+        with self.assertRaisesRegex(OSError, "accepted 1/2 events"):
+            platform.send_idle_pulse(45, mode="mouse")
+        for call in platform.user32.SendInput.call_args_list:
+            self.assertTrue(all(event.type == 0 for event in call.args[1]))
