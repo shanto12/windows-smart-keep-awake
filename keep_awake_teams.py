@@ -10,7 +10,7 @@ RUN (PowerShell on Windows)
     py keep_awake_teams.py --duration 3600
     py keep_awake_teams.py --dry-run
     py keep_awake_teams.py --once --verbose
-    py keep_awake_teams.py --self-test
+    py -m unittest discover -s tests -v
     py keep_awake_teams.py --docs
 
 DEFAULT BEHAVIOR
@@ -69,6 +69,12 @@ MIGRATING FROM THE GRAPH VERSION OF THIS FILE
     programs that produce input can still affect Windows/Teams inactivity.
 
 VALIDATION AND CLI DETAILS
+    A normal run prints an active confirmation, one heartbeat every five
+    minutes, and a shutdown message after release to standard output (including
+    PyCharm's Run console). Timestamps use local time. Heartbeats confirm this process
+    is running, not the actual sleep state or any Teams badge. --verbose adds
+    startup settings and native-call details, with no per-loop output.
+
     --dry-run prints the intended behavior and exits on any OS without loading
     Windows DLLs or changing anything. --once briefly requests sleep prevention
     and immediately releases it: it does NOT keep Windows awake after exit.
@@ -78,8 +84,10 @@ VALIDATION AND CLI DETAILS
     force termination cannot run Python cleanup. An API error returns exit 1,
     invalid arguments exit 2, and a handled interruption exits 130.
 
-    --self-test runs the embedded offline tests using a fake Windows interface.
-    Existing repository CI does not invoke them, so run --self-test explicitly.
+    Offline tests live separately in tests/test_keep_awake_teams.py and run
+    through the existing CI unittest discovery command. From the repository
+    root, run: py -m unittest discover -s tests -v. The former --self-test
+    option has been removed; the standalone runtime needs no test files.
     Automated tests cannot establish the actual badge displayed to colleagues
     or verify sleep behavior on your Windows laptop. Those require observation
     on that device with Teams left to run normally; this script does not perform
@@ -111,6 +119,22 @@ WAIT_SECONDS = 30.0
 HEARTBEAT_SECONDS = 300.0
 
 
+def configure_logging(verbose=False) -> None:
+    """Use the current Run console even if an IDE already configured root logging."""
+    for handler in list(LOGGER.handlers):
+        if getattr(handler, "_keep_awake_console", False):
+            LOGGER.removeHandler(handler)
+            handler.close()
+    handler = logging.StreamHandler(sys.stdout)
+    handler._keep_awake_console = True
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    )
+    LOGGER.addHandler(handler)
+    LOGGER.setLevel(logging.DEBUG if verbose else logging.INFO)
+    LOGGER.propagate = False
+
+
 def positive_seconds(value: str) -> float:
     try:
         seconds = float(value)
@@ -126,13 +150,14 @@ class WindowsPlatform:
 
     def __init__(self) -> None:
         if os.name != "nt":
-            raise OSError("live mode requires Windows; --dry-run and --self-test work here")
+            raise OSError("live mode requires Windows; use --dry-run here")
         self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         self.kernel32.SetThreadExecutionState.argtypes = [ctypes.c_uint32]
         self.kernel32.SetThreadExecutionState.restype = ctypes.c_uint32
 
     def set_keep_awake(self, enabled: bool) -> None:
         flags = ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if enabled else 0)
+        LOGGER.debug("SetThreadExecutionState flags=0x%08X", flags)
         if not self.kernel32.SetThreadExecutionState(flags):
             # This API does not document a useful GetLastError value.
             raise OSError("SetThreadExecutionState failed; Windows rejected the power request")
@@ -174,36 +199,45 @@ class KeepAwakeRunner:
 
         acquired = False
         try:
+            LOGGER.debug(
+                "Run settings: duration=%s; heartbeat every %.0fs; Teams access off",
+                "unlimited" if self.duration is None else "%.3gs" % self.duration,
+                self.heartbeat_seconds,
+            )
             self.platform.set_keep_awake(True)
             acquired = True
-            started = self.monotonic()
-            next_heartbeat = started + self.heartbeat_seconds
+            started_at = self.monotonic()
             LOGGER.info(
-                "Running: Windows sleep prevention is active; Teams presence is unmanaged"
+                "Running: Windows sleep-prevention request active; %s",
+                "one-shot check" if once else "press Ctrl+C to stop",
             )
             if once:
+                LOGGER.debug("One-shot check complete; stopping")
                 return 0
-            deadline = started + self.duration if self.duration is not None else None
+            deadline = started_at + self.duration if self.duration is not None else None
+            next_heartbeat = started_at + self.heartbeat_seconds
             while True:
+                current = self.monotonic()
                 delay = WAIT_SECONDS
                 if deadline is not None:
-                    remaining = deadline - self.monotonic()
+                    remaining = deadline - current
                     if remaining <= 0:
+                        LOGGER.debug("Duration complete; stopping")
                         return 0
                     delay = min(delay, remaining)
-                self.sleep(delay)
-                current = self.monotonic()
                 if current >= next_heartbeat:
-                    elapsed = current - started
                     LOGGER.info(
-                        "Still running: Windows sleep prevention active; elapsed %.0f seconds",
-                        elapsed,
+                        "Still running (%.0fs elapsed); Windows sleep prevention requested",
+                        current - started_at,
                     )
+                    # A late wake emits one heartbeat, never a catch-up burst.
                     next_heartbeat = current + self.heartbeat_seconds
+                delay = min(delay, next_heartbeat - current)
+                self.sleep(delay)
         finally:
             if acquired:
                 self.platform.set_keep_awake(False)
-                LOGGER.info("Windows awake request released; normal power behavior resumes")
+                LOGGER.info("Stopped: Windows sleep-prevention request released")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -233,12 +267,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="briefly acquire and release the power request, then exit",
     )
     parser.add_argument(
-        "--verbose", action="store_true", help="log request acquisition and cleanup"
+        "--verbose", action="store_true", help="add startup settings and native-call details"
     )
     parser.add_argument(
         "--docs", action="store_true", help="print setup, behavior, and limitations"
     )
-    parser.add_argument("--self-test", action="store_true", help="run embedded offline tests")
     parser.add_argument("--version", action="version", version="2.0.0")
     return parser
 
@@ -252,13 +285,7 @@ def main(argv=None) -> int:
     if args.docs:
         print(__doc__)
         return 0
-    if args.self_test:
-        return run_self_tests()
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    configure_logging(args.verbose)
     previous_sigterm = None
     signal_installed = False
     try:
@@ -268,7 +295,7 @@ def main(argv=None) -> int:
             signal_installed = True
         return KeepAwakeRunner(platform, args.duration, args.dry_run).run(once=args.once)
     except KeyboardInterrupt:
-        LOGGER.info("Stopped")
+        LOGGER.debug("Interrupted; exiting with status 130")
         return 130
     except OSError as error:
         LOGGER.error("%s", error)
@@ -276,186 +303,6 @@ def main(argv=None) -> int:
     finally:
         if signal_installed:
             signal.signal(signal.SIGTERM, previous_sigterm)
-
-
-def run_self_tests() -> int:
-    """Keep tests in this file; no real Windows, input, or network operations."""
-    import contextlib
-    import io
-    import unittest
-    from unittest.mock import Mock, patch
-
-    class FakePlatform:
-        def __init__(self):
-            self.calls = []
-
-        def set_keep_awake(self, enabled):
-            self.calls.append(enabled)
-
-    class RunnerTests(unittest.TestCase):
-        def test_default_holds_request_across_multiple_waits(self):
-            platform = FakePlatform()
-            waits = []
-
-            def sleep(delay):
-                self.assertEqual(platform.calls, [True])
-                waits.append(delay)
-                if len(waits) == 3:
-                    raise KeyboardInterrupt
-
-            with self.assertRaises(KeyboardInterrupt):
-                KeepAwakeRunner(platform, sleep=sleep).run()
-            self.assertEqual(platform.calls, [True, False])
-            self.assertEqual(waits, [WAIT_SECONDS] * 3)
-
-        def test_duration_uses_elapsed_time_and_releases(self):
-            platform = FakePlatform()
-            elapsed = [100.0]
-            waits = []
-
-            def sleep(delay):
-                self.assertEqual(platform.calls, [True])
-                elapsed[0] += delay
-                waits.append(delay)
-
-            runner = KeepAwakeRunner(
-                platform, duration=65, monotonic=lambda: elapsed[0], sleep=sleep
-            )
-            self.assertEqual(runner.run(), 0)
-            self.assertEqual(waits, [30, 30, 5])
-            self.assertEqual(platform.calls, [True, False])
-
-        def test_fractional_duration(self):
-            elapsed = [0.0]
-
-            def sleep(delay):
-                elapsed[0] += delay
-
-            platform = FakePlatform()
-            KeepAwakeRunner(
-                platform, duration=0.25, monotonic=lambda: elapsed[0], sleep=sleep
-            ).run()
-            self.assertEqual(elapsed[0], 0.25)
-            self.assertEqual(platform.calls, [True, False])
-
-        def test_once_releases_without_waiting(self):
-            platform = FakePlatform()
-            sleep = Mock(side_effect=AssertionError("must not wait"))
-            self.assertEqual(KeepAwakeRunner(platform, sleep=sleep).run(once=True), 0)
-            self.assertEqual(platform.calls, [True, False])
-            sleep.assert_not_called()
-
-        def test_dry_run_has_no_native_calls_or_waits(self):
-            platform = Mock()
-            sleep = Mock(side_effect=AssertionError("must not wait"))
-            self.assertEqual(KeepAwakeRunner(platform, dry_run=True, sleep=sleep).run(), 0)
-            platform.set_keep_awake.assert_not_called()
-            sleep.assert_not_called()
-
-        def test_unexpected_error_still_releases_request(self):
-            platform = FakePlatform()
-            sleep = Mock(side_effect=RuntimeError("test failure"))
-            with self.assertRaises(RuntimeError):
-                KeepAwakeRunner(platform, sleep=sleep).run()
-            self.assertEqual(platform.calls, [True, False])
-
-        def test_rejected_acquisition_is_not_reported_active(self):
-            platform = Mock()
-            platform.set_keep_awake.side_effect = OSError("request rejected")
-            with self.assertRaises(OSError):
-                KeepAwakeRunner(platform).run(once=True)
-            platform.set_keep_awake.assert_called_once_with(True)
-
-        def test_cleanup_failure_is_reported(self):
-            platform = Mock()
-            platform.set_keep_awake.side_effect = [None, OSError("cleanup rejected")]
-            with self.assertRaisesRegex(OSError, "cleanup rejected"):
-                KeepAwakeRunner(platform).run(once=True)
-            self.assertEqual(platform.set_keep_awake.call_count, 2)
-
-    class NativeBoundaryTests(unittest.TestCase):
-        def test_only_system_request_flags_and_cleanup(self):
-            platform = WindowsPlatform.__new__(WindowsPlatform)
-            platform.kernel32 = Mock()
-            platform.kernel32.SetThreadExecutionState.return_value = 1
-            platform.set_keep_awake(True)
-            platform.set_keep_awake(False)
-            self.assertEqual(
-                [call.args[0] for call in platform.kernel32.SetThreadExecutionState.call_args_list],
-                [0x80000001, 0x80000000],
-            )
-            self.assertEqual(set(platform.kernel32._mock_children), {"SetThreadExecutionState"})
-
-        def test_zero_native_return_is_an_error(self):
-            platform = WindowsPlatform.__new__(WindowsPlatform)
-            platform.kernel32 = Mock()
-            platform.kernel32.SetThreadExecutionState.return_value = 0
-            with self.assertRaises(OSError):
-                platform.set_keep_awake(True)
-
-    class CliTests(unittest.TestCase):
-        def test_default_is_no_teams_and_no_duration(self):
-            args = build_parser().parse_args([])
-            self.assertEqual(args.teams, "off")
-            self.assertIsNone(args.duration)
-            self.assertEqual(build_parser().parse_args(["--teams", "off"]).teams, "off")
-
-        def test_invalid_duration_values(self):
-            for value in ("nan", "inf", "-1", "0", "bad"):
-                with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
-                    positive_seconds(value)
-
-        def test_former_graph_and_schedule_options_are_rejected(self):
-            for args in (
-                ["--teams", "graph"],
-                ["--hours", "08:00-18:00"],
-                ["--holiday", "2026-12-25"],
-                ["--client-id", "example"],
-                ["--presence-mode", "preferred"],
-            ):
-                with (
-                    contextlib.redirect_stderr(io.StringIO()),
-                    self.assertRaises(SystemExit) as result,
-                ):
-                    build_parser().parse_args(args)
-                self.assertEqual(result.exception.code, 2)
-
-        def test_main_dry_run_does_not_load_windows_or_change_signal(self):
-            module = sys.modules[__name__]
-            with (
-                patch.object(module, "WindowsPlatform") as platform,
-                patch.object(signal, "signal") as handler,
-            ):
-                self.assertEqual(main(["--dry-run"]), 0)
-                platform.assert_not_called()
-                handler.assert_not_called()
-
-        def test_main_live_once_restores_signal_and_clears(self):
-            module = sys.modules[__name__]
-            platform = FakePlatform()
-            with (
-                patch.object(module, "WindowsPlatform", return_value=platform),
-                patch.object(signal, "signal", return_value=signal.SIG_DFL) as handler,
-            ):
-                self.assertEqual(main(["--once"]), 0)
-            self.assertEqual(platform.calls, [True, False])
-            self.assertEqual(handler.call_args.args, (signal.SIGTERM, signal.SIG_DFL))
-
-        def test_main_reports_native_failure_without_traceback(self):
-            module = sys.modules[__name__]
-            with patch.object(module, "WindowsPlatform", side_effect=OSError("unsupported")):
-                self.assertEqual(main([]), 1)
-
-        def test_stop_raises_interrupt(self):
-            with self.assertRaises(KeyboardInterrupt):
-                stop(signal.SIGTERM, None)
-
-    suite = unittest.TestSuite()
-    for case in (RunnerTests, NativeBoundaryTests, CliTests):
-        suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(case))
-    with patch.object(LOGGER, "disabled", True):
-        result = unittest.TextTestRunner(verbosity=2).run(suite)
-    return 0 if result.wasSuccessful() else 1
 
 
 if __name__ == "__main__":
