@@ -108,6 +108,7 @@ LOGGER = logging.getLogger("keep_awake_teams")
 ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001
 WAIT_SECONDS = 30.0
+HEARTBEAT_SECONDS = 300.0
 
 
 def positive_seconds(value: str) -> float:
@@ -140,12 +141,21 @@ class WindowsPlatform:
 class KeepAwakeRunner:
     """Hold and release the request on the calling thread, regardless of time/day."""
 
-    def __init__(self, platform=None, duration=None, dry_run=False, monotonic=None, sleep=None):
+    def __init__(
+        self,
+        platform=None,
+        duration=None,
+        dry_run=False,
+        monotonic=None,
+        sleep=None,
+        heartbeat_seconds=HEARTBEAT_SECONDS,
+    ):
         self.platform = platform
         self.duration = duration
         self.dry_run = dry_run
         self.monotonic = monotonic or time.monotonic
         self.sleep = sleep or time.sleep
+        self.heartbeat_seconds = heartbeat_seconds
 
     def run(self, once=False) -> int:
         if self.dry_run:
@@ -166,10 +176,14 @@ class KeepAwakeRunner:
         try:
             self.platform.set_keep_awake(True)
             acquired = True
-            LOGGER.info("Windows system-awake request active; Teams manages its own presence")
+            started = self.monotonic()
+            next_heartbeat = started + self.heartbeat_seconds
+            LOGGER.info(
+                "Running: Windows sleep prevention is active; Teams presence is unmanaged"
+            )
             if once:
                 return 0
-            deadline = self.monotonic() + self.duration if self.duration is not None else None
+            deadline = started + self.duration if self.duration is not None else None
             while True:
                 delay = WAIT_SECONDS
                 if deadline is not None:
@@ -178,6 +192,14 @@ class KeepAwakeRunner:
                         return 0
                     delay = min(delay, remaining)
                 self.sleep(delay)
+                current = self.monotonic()
+                if current >= next_heartbeat:
+                    elapsed = current - started
+                    LOGGER.info(
+                        "Still running: Windows sleep prevention active; elapsed %.0f seconds",
+                        elapsed,
+                    )
+                    next_heartbeat = current + self.heartbeat_seconds
         finally:
             if acquired:
                 self.platform.set_keep_awake(False)
@@ -233,7 +255,7 @@ def main(argv=None) -> int:
     if args.self_test:
         return run_self_tests()
     logging.basicConfig(
-        level=logging.INFO if args.verbose or args.dry_run else logging.WARNING,
+        level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
