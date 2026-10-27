@@ -1,10 +1,32 @@
 #!/usr/bin/env python3
-"""Minimal, idle-aware Windows keep-awake utility.
+"""Windows Smart Keep Awake.
 
-The program stays inside a configured local-time window (08:00-18:00 by
-default), prevents system sleep while that window is active, and sends a
-rare, non-text F24 key pulse only when the detected/configured inactivity
-timeout is close.  It is intentionally Windows-only and dependency-free.
+Keeps a Windows laptop or VM awake during work hours, keeps Microsoft Teams
+"Available" while you are away from the keyboard, and lets Teams go "Away"
+naturally during a lunch break. Python 3.9+, standard library only, one file.
+
+Two different things are handled, because Windows treats them differently:
+
+1. Machine awake (sleep / display off). Uses SetThreadExecutionState, the
+   documented API that video players and PowerToys Awake use. No input is
+   simulated, nothing is written to disk or registry, and the request ends
+   automatically when this process exits.
+
+2. Teams presence and screen lock. Teams marks you Away after about five
+   minutes without keyboard/mouse input (the same idle timer that drives the
+   screen saver and inactivity lock). A power request does NOT reset that
+   timer, so during work hours, and only after you have been idle for a
+   while, one F24 key tap is sent. F24 exists on no physical keyboard, types
+   nothing and moves nothing. If Windows does not register it, the script
+   switches to a 1-pixel mouse move-and-return.
+
+During breaks (default 12:00-13:00) no input is sent, so Teams turns Away on
+its own after its normal timeout while the machine itself stays awake.
+Outside work hours everything is released and Windows behaves normally.
+
+The script never runs while you are typing, never touches a locked or secure
+desktop, never unlocks anything, and changes no settings. Run it only on a
+device and in a way your organisation permits.
 """
 
 from __future__ import annotations
@@ -13,608 +35,637 @@ import argparse
 import ctypes
 import datetime as dt
 import logging
+import math
 import os
+import signal
 import sys
 import time
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple
+from functools import lru_cache
+from typing import Callable, Dict, FrozenSet, Optional, Sequence, Tuple
 
+VERSION = "4.0.0"
+LOG = logging.getLogger("keep_awake")
 
-LOGGER = logging.getLogger("keep_awake")
-
+WORK, BREAK, OFF = "work", "break", "off"
 DEFAULT_HOURS = "08:00-18:00"
-DEFAULT_LOCK_AFTER_SECONDS = 600.0
-DEFAULT_WAKE_BEFORE_SECONDS = 30.0
-DEFAULT_POLL_SECONDS = 15.0
-DEFAULT_COOLDOWN_SECONDS = 180.0
-DEFAULT_INPUT_MODE = "f24"
+DEFAULT_BREAKS = ("12:00-13:00",)
+DEFAULT_DAYS = "mon-fri"
+DEFAULT_IDLE_SECONDS = 120.0  # Teams goes Away after ~300s; stay well inside it.
+MIN_IDLE_SECONDS = 10.0
+VERIFY_SECONDS = 2.0
+RETRY_SECONDS = 300.0
+OFF_POLL_SECONDS = 30.0
+HEARTBEAT_SECONDS = 1800.0
+DAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
-KEYEVENTF_KEYUP = 0x0002
-INPUT_MOUSE = 0
-INPUT_KEYBOARD = 1
-MOUSEEVENTF_MOVE = 0x0001
-VK_F24 = 0x87
-
-ES_CONTINUOUS = 0x80000000
-ES_SYSTEM_REQUIRED = 0x00000001
-
-SPI_GETSCREENSAVETIMEOUT = 14
-SPI_GETSCREENSAVEACTIVE = 16
-SPI_GETSCREENSAVESECURE = 0x0076
+TimeRange = Tuple[dt.time, dt.time]
 
 
-def parse_clock(value: str) -> dt.time:
-    """Parse a local time in HH:MM form."""
+# --------------------------------------------------------------------------
+# Schedule
+# --------------------------------------------------------------------------
 
+
+def parse_clock(text: str) -> dt.time:
     try:
-        hour_text, minute_text = value.strip().split(":", 1)
-        hour = int(hour_text)
-        minute = int(minute_text)
-    except (AttributeError, ValueError):
-        raise ValueError("time must use HH:MM, for example 08:00")
-    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
-        raise ValueError("time must be between 00:00 and 23:59")
-    return dt.time(hour=hour, minute=minute)
-
-
-def parse_hours(value: str) -> "Schedule":
-    """Parse a schedule such as 08:00-18:00 or 22:00-06:00."""
-
-    try:
-        start_text, end_text = value.split("-", 1)
+        hour, minute = (int(part) for part in text.strip().split(":"))
     except ValueError:
-        raise ValueError("hours must use START-END, for example 08:00-18:00")
-    return Schedule(parse_clock(start_text), parse_clock(end_text))
+        raise ValueError("time %r must use HH:MM" % text) from None
+    if hour == 24 and minute == 0:
+        return dt.time(0, 0)
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError("time %r is out of range" % text)
+    return dt.time(hour, minute)
 
 
-def parse_seconds(value: str) -> float:
-    try:
-        seconds = float(value)
-    except (TypeError, ValueError):
-        raise ValueError("seconds must be a number")
-    if seconds <= 0:
-        raise ValueError("seconds must be greater than zero")
-    return seconds
+def parse_range(text: str) -> TimeRange:
+    start, sep, end = text.partition("-")
+    if not sep:
+        raise ValueError("range %r must use HH:MM-HH:MM" % text)
+    return parse_clock(start), parse_clock(end)
 
 
-def parse_nonnegative_seconds(value: str) -> float:
-    try:
-        seconds = float(value)
-    except (TypeError, ValueError):
-        raise ValueError("seconds must be a number")
-    if seconds < 0:
-        raise ValueError("seconds cannot be negative")
-    return seconds
+def parse_days(text: str) -> FrozenSet[int]:
+    days = set()
+    for part in text.lower().replace(" ", "").split(","):
+        first, sep, last = part.partition("-")
+        if first not in DAY_NAMES or (sep and last not in DAY_NAMES):
+            raise ValueError("days must look like mon-fri or mon,wed,fri")
+        a = DAY_NAMES.index(first)
+        b = DAY_NAMES.index(last) if sep else a
+        days.update(range(a, b + 1) if a <= b else (*range(a, 7), *range(0, b + 1)))
+    return frozenset(days)
 
 
-def parse_lock_after(value: str) -> Optional[float]:
-    if value.strip().lower() == "auto":
-        return None
-    return parse_seconds(value)
+def in_range(moment: dt.time, span: TimeRange) -> bool:
+    start, end = span
+    if start == end:
+        return True
+    if start < end:
+        return start <= moment < end
+    return moment >= start or moment < end  # overnight span
+
+
+def format_range(span: TimeRange) -> str:
+    return "%s-%s" % (span[0].strftime("%H:%M"), span[1].strftime("%H:%M"))
+
+
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> dt.date:
+    first = dt.date(year, month, 1)
+    return first + dt.timedelta(days=(weekday - first.weekday()) % 7 + 7 * (n - 1))
+
+
+@lru_cache(maxsize=8)
+def us_federal_holidays(year: int) -> Dict[dt.date, str]:
+    """US federal holidays for ``year``, including weekend observance."""
+    result: Dict[dt.date, str] = {}
+    for y in (year - 1, year, year + 1):  # Jan 1 can be observed on Dec 31
+        may_31 = dt.date(y, 5, 31)
+        dates = {
+            dt.date(y, 1, 1): "New Year's Day",
+            _nth_weekday(y, 1, 0, 3): "Martin Luther King Jr. Day",
+            _nth_weekday(y, 2, 0, 3): "Washington's Birthday",
+            may_31 - dt.timedelta(days=may_31.weekday()): "Memorial Day",
+            dt.date(y, 6, 19): "Juneteenth",
+            dt.date(y, 7, 4): "Independence Day",
+            _nth_weekday(y, 9, 0, 1): "Labor Day",
+            _nth_weekday(y, 10, 0, 2): "Columbus Day",
+            dt.date(y, 11, 11): "Veterans Day",
+            _nth_weekday(y, 11, 3, 4): "Thanksgiving Day",
+            dt.date(y, 12, 25): "Christmas Day",
+        }
+        for day, name in dates.items():
+            shift = {5: -1, 6: 1}.get(day.weekday(), 0)
+            observed = day + dt.timedelta(days=shift)
+            if observed.year == year:
+                result[observed] = name + (" (observed)" if shift else "")
+    return result
 
 
 @dataclass(frozen=True)
 class Schedule:
-    """A daily local-time window; overnight windows are supported."""
+    hours: TimeRange = (dt.time(8), dt.time(18))
+    breaks: Tuple[TimeRange, ...] = ((dt.time(12), dt.time(13)),)
+    days: FrozenSet[int] = frozenset(range(5))
+    holidays: FrozenSet[dt.date] = frozenset()
+    us_holidays: bool = False
 
-    start: dt.time
-    end: dt.time
-
-    def contains(self, now: dt.datetime) -> bool:
-        if self.start == self.end:
-            return True
-        if self.start < self.end:
-            return self.start <= now.time() < self.end
-        return now.time() >= self.start or now.time() < self.end
-
-    def seconds_until_start(self, now: dt.datetime) -> float:
-        if self.contains(now):
-            return 0.0
-        start_date = now.date()
-        if now.time() >= self.start:
-            start_date += dt.timedelta(days=1)
-        start = dt.datetime.combine(start_date, self.start)
-        return max(0.0, (start - now).total_seconds())
-
-
-@dataclass(frozen=True)
-class Settings:
-    schedule: Schedule
-    lock_after_seconds: float
-    wake_before_seconds: float = DEFAULT_WAKE_BEFORE_SECONDS
-    poll_seconds: float = DEFAULT_POLL_SECONDS
-    cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS
-    input_mode: str = DEFAULT_INPUT_MODE
-    prevent_sleep: bool = True
-    dry_run: bool = False
+    def phase(self, now: dt.datetime) -> Tuple[str, str]:
+        """Return (WORK|BREAK|OFF, human-readable reason) for a local time."""
+        day = now.date()
+        if day in self.holidays:
+            return OFF, "holiday"
+        if self.us_holidays and day in us_federal_holidays(day.year):
+            return OFF, us_federal_holidays(day.year)[day]
+        if now.weekday() not in self.days:
+            return OFF, "not a work day"
+        moment = now.time()
+        if not in_range(moment, self.hours):
+            return OFF, "outside %s" % format_range(self.hours)
+        for span in self.breaks:
+            if in_range(moment, span):
+                return BREAK, "break %s" % format_range(span)
+        return WORK, "work hours %s" % format_range(self.hours)
 
 
-def should_pulse(
-    scheduled: bool,
-    idle_seconds: float,
-    lock_after_seconds: float,
-    wake_before_seconds: float,
-    monotonic_now: float,
-    last_pulse_monotonic: Optional[float],
-    cooldown_seconds: float,
-) -> bool:
-    """Return True only when the idle timeout is close and cooldown allows it."""
-
-    if not scheduled:
-        return False
-    threshold = max(0.0, lock_after_seconds - wake_before_seconds)
-    if idle_seconds < threshold:
-        return False
-    if last_pulse_monotonic is not None:
-        if monotonic_now - last_pulse_monotonic < cooldown_seconds:
-            return False
-    return True
+def effective_idle_seconds(requested: float, lock_limits: Sequence[Optional[float]]) -> float:
+    """Pulse at the requested idle time, or at half of a shorter lock timeout."""
+    limits = [v for v in lock_limits if v and v > 0 and math.isfinite(v)]
+    chosen = min([requested] + [v / 2 for v in limits])
+    return max(MIN_IDLE_SECONDS, chosen)
 
 
-class _POINT(ctypes.Structure):
-    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+# --------------------------------------------------------------------------
+# Windows platform (ctypes only)
+# --------------------------------------------------------------------------
+
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+ES_DISPLAY_REQUIRED = 0x00000002
+INPUT_MOUSE, INPUT_KEYBOARD = 0, 1
+VK_F24 = 0x87
+KEYEVENTF_KEYUP = 0x0002
+MOUSEEVENTF_MOVE = 0x0001
+MOUSEEVENTF_MOVE_NOCOALESCE = 0x2000
+MOUSEEVENTF_VIRTUALDESK = 0x4000
+MOUSEEVENTF_ABSOLUTE = 0x8000
+SPI_GETSCREENSAVEACTIVE = 0x0010
+SPI_GETSCREENSAVETIMEOUT = 0x000E
+DESKTOP_READOBJECTS = 0x0001
+UOI_NAME, UOI_IO = 2, 6
+ERROR_ALREADY_EXISTS = 183
+SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN = 76, 77, 78, 79
+# Shift, Ctrl, Alt, Win (L/R), F24, mouse buttons: never inject while held.
+HELD_KEYS = (0x10, 0x11, 0x12, 0x5B, 0x5C, VK_F24, 0x01, 0x02, 0x04, 0x05, 0x06)
+
+# Windows LONG/DWORD are 32-bit even on 64-bit Python.
+DWORD, LONG, WORD, BOOL = ctypes.c_uint32, ctypes.c_int32, ctypes.c_uint16, ctypes.c_int32
+ULONG_PTR = ctypes.c_size_t
 
 
-class _LASTINPUTINFO(ctypes.Structure):
-    _fields_ = [("cbSize", ctypes.c_uint32), ("dwTime", ctypes.c_uint32)]
+class LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [("cbSize", DWORD), ("dwTime", DWORD)]
 
 
-class _MOUSEINPUT(ctypes.Structure):
-    _fields_ = [
-        ("dx", ctypes.c_long),
-        ("dy", ctypes.c_long),
-        ("mouseData", ctypes.c_uint32),
-        ("dwFlags", ctypes.c_uint32),
-        ("time", ctypes.c_uint32),
-        ("dwExtraInfo", ctypes.c_size_t),
-    ]
+class POINT(ctypes.Structure):
+    _fields_ = [("x", LONG), ("y", LONG)]
 
 
-class _KEYBDINPUT(ctypes.Structure):
-    _fields_ = [
-        ("wVk", ctypes.c_uint16),
-        ("wScan", ctypes.c_uint16),
-        ("dwFlags", ctypes.c_uint32),
-        ("time", ctypes.c_uint32),
-        ("dwExtraInfo", ctypes.c_size_t),
-    ]
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", WORD), ("wScan", WORD), ("dwFlags", DWORD), ("time", DWORD),
+                ("dwExtraInfo", ULONG_PTR)]
 
 
-class _HARDWAREINPUT(ctypes.Structure):
-    _fields_ = [
-        ("uMsg", ctypes.c_uint32),
-        ("wParamL", ctypes.c_uint16),
-        ("wParamH", ctypes.c_uint16),
-    ]
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", LONG), ("dy", LONG), ("mouseData", DWORD), ("dwFlags", DWORD),
+                ("time", DWORD), ("dwExtraInfo", ULONG_PTR)]
 
 
-class _INPUT_UNION(ctypes.Union):
-    _fields_ = [
-        ("mi", _MOUSEINPUT),
-        ("ki", _KEYBDINPUT),
-        ("hi", _HARDWAREINPUT),
-    ]
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [("uMsg", DWORD), ("wParamL", WORD), ("wParamH", WORD)]
 
 
-class _INPUT(ctypes.Structure):
+class _INPUTUNION(ctypes.Union):
+    _fields_ = [("ki", KEYBDINPUT), ("mi", MOUSEINPUT), ("hi", HARDWAREINPUT)]
+
+
+class INPUT(ctypes.Structure):
     _anonymous_ = ("u",)
-    _fields_ = [("type", ctypes.c_uint32), ("u", _INPUT_UNION)]
+    _fields_ = [("type", DWORD), ("u", _INPUTUNION)]
 
 
 class WindowsPlatform:
-    """Small wrapper around the Windows APIs used by the runner."""
+    """Thin wrapper around the handful of documented Win32 calls we need."""
 
     def __init__(self) -> None:
         if os.name != "nt":
-            raise RuntimeError("keep_awake.py must be run on Windows")
+            raise OSError("this needs Windows; use --dry-run to preview elsewhere")
+        k32 = self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        u32 = self.user32 = ctypes.WinDLL("user32", use_last_error=True)
+        for fn, args, res in (
+            (k32.SetThreadExecutionState, [DWORD], DWORD),
+            (k32.GetTickCount, [], DWORD),
+            (k32.CreateMutexW, [ctypes.c_void_p, BOOL, ctypes.c_wchar_p], ctypes.c_void_p),
+            (u32.GetLastInputInfo, [ctypes.POINTER(LASTINPUTINFO)], BOOL),
+            (u32.SendInput, [ctypes.c_uint, ctypes.POINTER(INPUT), ctypes.c_int], ctypes.c_uint),
+            (u32.SystemParametersInfoW, [ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p,
+                                         ctypes.c_uint], BOOL),
+            (u32.OpenInputDesktop, [DWORD, BOOL, DWORD], ctypes.c_void_p),
+            (u32.GetUserObjectInformationW, [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+                                             DWORD, ctypes.POINTER(DWORD)], BOOL),
+            (u32.CloseDesktop, [ctypes.c_void_p], BOOL),
+            (u32.GetAsyncKeyState, [ctypes.c_int], ctypes.c_int16),
+            (u32.GetCursorPos, [ctypes.POINTER(POINT)], BOOL),
+            (u32.GetSystemMetrics, [ctypes.c_int], ctypes.c_int),
+        ):
+            fn.argtypes, fn.restype = args, res
+        self._mutex = None
 
-        self.user32 = ctypes.WinDLL("user32", use_last_error=True)
-        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    # -- process ----------------------------------------------------------
+    def claim_single_instance(self) -> bool:
+        self._mutex = self.kernel32.CreateMutexW(None, False, "Local\\WindowsSmartKeepAwake")
+        return not (self._mutex and ctypes.get_last_error() == ERROR_ALREADY_EXISTS)
 
-        self.user32.GetLastInputInfo.argtypes = [ctypes.POINTER(_LASTINPUTINFO)]
-        self.user32.GetLastInputInfo.restype = ctypes.c_bool
-        self.kernel32.GetTickCount64.argtypes = []
-        self.kernel32.GetTickCount64.restype = ctypes.c_uint64
+    # -- power ------------------------------------------------------------
+    def set_awake(self, enabled: bool) -> None:
+        flags = ES_CONTINUOUS | (ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED if enabled else 0)
+        if not self.kernel32.SetThreadExecutionState(flags):
+            raise OSError("Windows rejected the keep-awake power request")
 
-        self.kernel32.SetThreadExecutionState.argtypes = [ctypes.c_uint32]
-        self.kernel32.SetThreadExecutionState.restype = ctypes.c_uint32
-
-        self.user32.SendInput.argtypes = [
-            ctypes.c_uint32,
-            ctypes.POINTER(_INPUT),
-            ctypes.c_int,
-        ]
-        self.user32.SendInput.restype = ctypes.c_uint32
-        self.user32.GetCursorPos.argtypes = [ctypes.POINTER(_POINT)]
-        self.user32.GetCursorPos.restype = ctypes.c_bool
-
-        self.user32.SystemParametersInfoW.argtypes = [
-            ctypes.c_uint32,
-            ctypes.c_uint32,
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-        ]
-        self.user32.SystemParametersInfoW.restype = ctypes.c_bool
-
-    @staticmethod
-    def _raise_last_error(operation: str) -> None:
-        error = ctypes.get_last_error()
-        if error:
-            raise OSError(error, "%s failed" % operation)
-        raise OSError("%s failed" % operation)
-
-    def get_idle_seconds(self) -> float:
-        info = _LASTINPUTINFO()
-        info.cbSize = ctypes.sizeof(_LASTINPUTINFO)
+    # -- idle state -------------------------------------------------------
+    def input_state(self) -> Tuple[int, float]:
+        """Return (last-input tick, seconds since last input)."""
+        info = LASTINPUTINFO(ctypes.sizeof(LASTINPUTINFO), 0)
         if not self.user32.GetLastInputInfo(ctypes.byref(info)):
-            self._raise_last_error("GetLastInputInfo")
-        current_tick = int(self.kernel32.GetTickCount64())
-        elapsed_ms = (current_tick - int(info.dwTime)) & 0xFFFFFFFF
-        return elapsed_ms / 1000.0
+            raise OSError("GetLastInputInfo failed")
+        elapsed = (self.kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF
+        return info.dwTime, elapsed / 1000.0
 
-    def _system_parameter_bool(self, action: int) -> Optional[bool]:
-        value = ctypes.c_int(0)
-        if self.user32.SystemParametersInfoW(
-            action, 0, ctypes.byref(value), 0
-        ):
-            return bool(value.value)
-        return None
+    def lock_timeouts(self) -> Tuple[Optional[float], Optional[float]]:
+        """(screen-saver timeout, machine inactivity lock) in seconds, if set."""
+        def spi(action: int) -> Optional[int]:
+            value = DWORD()
+            ok = self.user32.SystemParametersInfoW(action, 0, ctypes.byref(value), 0)
+            return value.value if ok else None
 
-    def detect_lock_timeout(self) -> Tuple[float, str]:
-        """Find the most conservative visible inactivity timeout.
-
-        Windows policy can be managed centrally or hidden from a normal user.
-        If no visible timeout is available, the documented fallback is ten
-        minutes; users can always override it with --lock-after SECONDS.
-        """
-
-        candidates = []
-        screen_saver_timeout = ctypes.c_uint32(0)
-        screen_saver_active = self._system_parameter_bool(SPI_GETSCREENSAVEACTIVE)
-        screen_saver_secure = self._system_parameter_bool(SPI_GETSCREENSAVESECURE)
-        if self.user32.SystemParametersInfoW(
-            SPI_GETSCREENSAVETIMEOUT,
-            0,
-            ctypes.byref(screen_saver_timeout),
-            0,
-        ):
-            secure_from_registry = False
-            try:
-                import winreg
-
-                with winreg.OpenKey(
-                    winreg.HKEY_CURRENT_USER, r"Control Panel\Desktop"
-                ) as key:
-                    secure_from_registry = str(
-                        winreg.QueryValueEx(key, "ScreenSaveIsSecure")[0]
-                    ) == "1"
-            except (OSError, ImportError):
-                pass
-            if (
-                screen_saver_timeout.value > 0
-                and screen_saver_active
-                and (screen_saver_secure or secure_from_registry)
-            ):
-                candidates.append(
-                    (float(screen_saver_timeout.value), "Windows screen saver")
-                )
-
+        saver = spi(SPI_GETSCREENSAVETIMEOUT) if spi(SPI_GETSCREENSAVEACTIVE) else None
+        machine = None
         try:
             import winreg
 
             with winreg.OpenKey(
                 winreg.HKEY_LOCAL_MACHINE,
                 r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
+                0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY,
             ) as key:
-                policy_seconds = int(
-                    winreg.QueryValueEx(key, "InactivityTimeoutSecs")[0]
-                )
-                if policy_seconds > 0:
-                    candidates.append(
-                        (float(policy_seconds), "Windows inactivity policy")
-                    )
-        except (OSError, ImportError, TypeError, ValueError):
+                value, kind = winreg.QueryValueEx(key, "InactivityTimeoutSecs")
+                if kind == winreg.REG_DWORD and value > 0:
+                    machine = float(value)
+        except OSError:
             pass
+        return (float(saver) if saver else None), machine
 
-        if candidates:
-            timeout, source = min(candidates, key=lambda candidate: candidate[0])
-            return timeout, source
-        return DEFAULT_LOCK_AFTER_SECONDS, "fallback (10 minutes)"
+    def desktop_ready(self) -> bool:
+        """True only on the normal, unlocked, interactive desktop."""
+        desk = self.user32.OpenInputDesktop(0, False, DESKTOP_READOBJECTS)
+        if not desk:
+            return False
+        try:
+            name = ctypes.create_unicode_buffer(64)
+            receiving = BOOL()
+            needed = DWORD()
+            return bool(
+                self.user32.GetUserObjectInformationW(desk, UOI_NAME, name, ctypes.sizeof(name),
+                                                      ctypes.byref(needed))
+                and self.user32.GetUserObjectInformationW(desk, UOI_IO, ctypes.byref(receiving),
+                                                          ctypes.sizeof(receiving),
+                                                          ctypes.byref(needed))
+                and name.value.lower() == "default"
+                and receiving.value
+            )
+        finally:
+            self.user32.CloseDesktop(desk)
 
-    def set_keep_awake(self, enabled: bool) -> None:
-        flags = ES_CONTINUOUS
-        if enabled:
-            flags |= ES_SYSTEM_REQUIRED
-        if not self.kernel32.SetThreadExecutionState(flags):
-            self._raise_last_error("SetThreadExecutionState")
+    def user_holding_input(self) -> bool:
+        return any(self.user32.GetAsyncKeyState(vk) & 0x8000 for vk in HELD_KEYS)
 
-    def _send_inputs(self, inputs) -> None:
-        input_array = (_INPUT * len(inputs))(*inputs)
-        sent = self.user32.SendInput(
-            len(input_array), input_array, ctypes.sizeof(_INPUT)
-        )
-        if sent != len(input_array):
-            self._raise_last_error("SendInput")
+    # -- input ------------------------------------------------------------
+    def _f24_events(self):
+        events = (INPUT * 2)()
+        for event in events:
+            event.type = INPUT_KEYBOARD
+            event.ki.wVk = VK_F24
+        events[1].ki.dwFlags = KEYEVENTF_KEYUP
+        return events
 
-    def pulse_f24(self) -> None:
-        key_down = _INPUT(
-            type=INPUT_KEYBOARD,
-            ki=_KEYBDINPUT(wVk=VK_F24, wScan=0, dwFlags=0, time=0, dwExtraInfo=0),
-        )
-        key_up = _INPUT(
-            type=INPUT_KEYBOARD,
-            ki=_KEYBDINPUT(
-                wVk=VK_F24,
-                wScan=0,
-                dwFlags=KEYEVENTF_KEYUP,
-                time=0,
-                dwExtraInfo=0,
-            ),
-        )
-        self._send_inputs([key_down, key_up])
-
-    def pulse_mouse(self) -> None:
-        point = _POINT()
+    def _mouse_events(self):
+        point = POINT()
         if not self.user32.GetCursorPos(ctypes.byref(point)):
-            self._raise_last_error("GetCursorPos")
-        direction = 1 if point.x == 0 else -1
-        first = _INPUT(
-            type=INPUT_MOUSE,
-            mi=_MOUSEINPUT(
-                dx=direction,
-                dy=0,
-                mouseData=0,
-                dwFlags=MOUSEEVENTF_MOVE,
-                time=0,
-                dwExtraInfo=0,
-            ),
-        )
-        second = _INPUT(
-            type=INPUT_MOUSE,
-            mi=_MOUSEINPUT(
-                dx=-direction,
-                dy=0,
-                mouseData=0,
-                dwFlags=MOUSEEVENTF_MOVE,
-                time=0,
-                dwExtraInfo=0,
-            ),
-        )
-        self._send_inputs([first])
-        time.sleep(0.02)
-        self._send_inputs([second])
+            return None
+        left, top, width, height = (self.user32.GetSystemMetrics(i) for i in (
+            SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN))
+        if width < 2 or height < 1:
+            return None
+        nudge_x = point.x + (1 if point.x < left + width - 1 else -1)
+        events = (INPUT * 2)()
+        # Absolute coordinates: immune to pointer acceleration, so it returns exactly.
+        for event, x in zip(events, (nudge_x, point.x)):
+            event.type = INPUT_MOUSE
+            event.mi.dx = min(65535, int((x - left + 0.5) * 65536 / width))
+            event.mi.dy = min(65535, int((point.y - top + 0.5) * 65536 / height))
+            event.mi.dwFlags = (MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE
+                                | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_ABSOLUTE)
+        return events
 
-    def pulse(self, mode: str) -> None:
-        if mode == "f24":
-            self.pulse_f24()
-        elif mode == "mouse":
-            self.pulse_mouse()
-        elif mode != "none":
-            raise ValueError("unknown input mode: %s" % mode)
+    def send_activity(self, mode: str) -> bool:
+        events = self._f24_events() if mode == "f24" else self._mouse_events()
+        if events is None:
+            return False
+        sent = self.user32.SendInput(2, events, ctypes.sizeof(INPUT))
+        if sent == 1:  # never leave F24 down or the pointer moved
+            self.user32.SendInput(1, (INPUT * 1)(events[1]), ctypes.sizeof(INPUT))
+        return sent == 2
 
 
-class KeepAwakeRunner:
-    """Run the schedule with injectable clocks so decisions are testable."""
+# --------------------------------------------------------------------------
+# Runner
+# --------------------------------------------------------------------------
 
+
+class Runner:
     def __init__(
         self,
-        settings: Settings,
-        platform: WindowsPlatform,
-        now: Optional[Callable[[], dt.datetime]] = None,
-        monotonic: Optional[Callable[[], float]] = None,
-        sleep: Optional[Callable[[float], None]] = None,
+        platform,
+        schedule: Schedule,
+        idle_seconds: float = DEFAULT_IDLE_SECONDS,
+        input_mode: str = "auto",
+        awake_on_breaks: bool = True,
+        awake_off_hours: bool = False,
+        duration: Optional[float] = None,
+        now: Callable[[], dt.datetime] = dt.datetime.now,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+        heartbeat_seconds: float = HEARTBEAT_SECONDS,
     ) -> None:
-        self.settings = settings
         self.platform = platform
-        self.now = now or dt.datetime.now
-        self.monotonic = monotonic or time.monotonic
-        self.sleep = sleep or time.sleep
-        self.last_pulse_monotonic = None  # type: Optional[float]
-        self.awake_enabled = False
-        self.last_scheduled = None  # type: Optional[bool]
+        self.schedule = schedule
+        self.requested_idle = idle_seconds
+        self.input_mode = input_mode
+        self.mode = "mouse" if input_mode == "mouse" else "f24"
+        self.awake_on_breaks = awake_on_breaks
+        self.awake_off_hours = awake_off_hours
+        self.duration = duration
+        self.now = now
+        self.monotonic = monotonic
+        self.sleep = sleep
+        self.heartbeat_seconds = heartbeat_seconds
+        self.threshold = idle_seconds
+        self.awake = False
+        self.pulses = 0
+        self._pending: Optional[Tuple[int, float]] = None  # (tick before pulse, verify by)
+        self._retry_at = 0.0
+        self._paused: Optional[str] = None
 
-    def step(self) -> Tuple[bool, Optional[float]]:
-        current = self.now()
-        scheduled = self.settings.schedule.contains(current)
-        if scheduled != self.last_scheduled:
-            LOGGER.info(
-                "%s schedule window at %s",
-                "inside" if scheduled else "outside",
-                current.strftime("%Y-%m-%d %H:%M:%S"),
-            )
-            self.last_scheduled = scheduled
+    # -- helpers ----------------------------------------------------------
+    def _set_awake(self, enabled: bool) -> None:
+        if enabled != self.awake:
+            self.platform.set_awake(enabled)
+            self.awake = enabled
+            LOG.info("Keep-awake %s", "ON (no sleep, display stays on)" if enabled else
+                     "OFF (normal Windows power settings)")
 
-        if not scheduled:
-            if self.awake_enabled:
-                self.platform.set_keep_awake(False)
-                self.awake_enabled = False
-            return False, None
+    def _pause(self, reason: Optional[str]) -> None:
+        if reason != self._paused:
+            if reason:
+                LOG.info("Activity paused: %s", reason)
+            elif self._paused:
+                LOG.info("Activity resumed")
+            self._paused = reason
 
-        if self.settings.prevent_sleep and not self.settings.dry_run:
-            if not self.awake_enabled:
-                self.platform.set_keep_awake(True)
-                self.awake_enabled = True
+    def _input_failed(self, why: str, clock: float) -> None:
+        if self.input_mode == "auto" and self.mode == "f24":
+            LOG.warning("F24 %s; switching to 1-pixel mouse nudge", why)
+            self.mode = "mouse"
+            return
+        LOG.warning("%s input %s; retrying in %d min (keep-awake unaffected)",
+                    self.mode, why, RETRY_SECONDS // 60)
+        self._retry_at = clock + RETRY_SECONDS
+        if self.input_mode == "auto":
+            self.mode = "f24"  # start the auto sequence again next time
 
-        idle_seconds = self.platform.get_idle_seconds()
-        now_monotonic = self.monotonic()
-        if should_pulse(
-            scheduled=True,
-            idle_seconds=idle_seconds,
-            lock_after_seconds=self.settings.lock_after_seconds,
-            wake_before_seconds=self.settings.wake_before_seconds,
-            monotonic_now=now_monotonic,
-            last_pulse_monotonic=self.last_pulse_monotonic,
-            cooldown_seconds=self.settings.cooldown_seconds,
-        ):
-            if self.settings.input_mode != "none" and not self.settings.dry_run:
-                self.platform.pulse(self.settings.input_mode)
-            self.last_pulse_monotonic = now_monotonic
-            LOGGER.info(
-                "%s idle pulse at %.1fs idle (mode=%s)",
-                "would send" if self.settings.dry_run else "sent",
-                idle_seconds,
-                self.settings.input_mode,
-            )
-        return True, idle_seconds
+    def _guard_activity(self, clock: float) -> None:
+        """Keep the idle timer below the threshold; only ever when user is idle."""
+        if self._pending is not None:
+            tick_before, verify_by = self._pending
+            tick, idle = self.platform.input_state()
+            if tick != tick_before:
+                self._pending = None
+                self.pulses += 1
+                LOG.debug("%s registered by Windows (idle reset)", self.mode)
+            elif clock >= verify_by:
+                self._pending = None
+                self._input_failed("was not registered by Windows", clock)
+            return
+        if clock < self._retry_at:
+            return
+        if not self.platform.desktop_ready():
+            self._pause("screen locked or session not interactive")
+            return
+        self._pause(None)
+        tick, idle = self.platform.input_state()
+        if idle < self.threshold or self.platform.user_holding_input():
+            return
+        if self.platform.send_activity(self.mode):
+            self._pending = (tick, clock + VERIFY_SECONDS)
+        else:
+            self._input_failed("was rejected by SendInput", clock)
 
-    def run(self, once: bool = False) -> None:
+    # -- main loop --------------------------------------------------------
+    def run(self) -> int:
+        self.threshold = effective_idle_seconds(self.requested_idle, self.platform.lock_timeouts())
+        LOG.info("Windows Smart Keep Awake v%s | days %s | hours %s | breaks %s | "
+                 "activity after %.0fs idle | Ctrl+C to stop",
+                 VERSION, ",".join(DAY_NAMES[d] for d in sorted(self.schedule.days)),
+                 format_range(self.schedule.hours),
+                 ", ".join(format_range(b) for b in self.schedule.breaks) or "none",
+                 self.threshold)
+        start = self.monotonic()
+        next_beat = start + self.heartbeat_seconds
+        last_phase = None
         try:
             while True:
-                scheduled, idle_seconds = self.step()
-                if once:
-                    return
-
-                current = self.now()
-                if not scheduled:
-                    delay = min(
-                        3600.0,
-                        max(0.5, self.settings.schedule.seconds_until_start(current)),
-                    )
+                clock = self.monotonic()
+                if self.duration is not None and clock - start >= self.duration:
+                    return 0
+                phase, reason = self.schedule.phase(self.now())
+                if (phase, reason) != last_phase:
+                    LOG.info("%s: %s", {WORK: "WORK", BREAK: "BREAK", OFF: "OFF"}[phase], {
+                        WORK: "keeping PC awake and Teams Available",
+                        BREAK: "no activity sent, Teams will go Away; PC %s" % (
+                            "stays awake" if self.awake_on_breaks or self.awake_off_hours
+                            else "may sleep"),
+                        OFF: "idle (%s)" % reason,
+                    }[phase] + ("" if phase == OFF else " (%s)" % reason))
+                    last_phase = (phase, reason)
+                    self._pending = None
+                    self._paused = None
+                self._set_awake(phase == WORK or self.awake_off_hours
+                                or (phase == BREAK and self.awake_on_breaks))
+                if phase == WORK and self.input_mode != "none":
+                    self._guard_activity(clock)
+                if clock >= next_beat:
+                    LOG.info("Still running: %s, activity pulses so far %d", phase, self.pulses)
+                    next_beat = clock + self.heartbeat_seconds
+                if phase == WORK and self.input_mode != "none":
+                    delay = 0.5 if self._pending else min(5.0, self.threshold / 4)
                 else:
-                    delay = self.settings.poll_seconds
-                    if idle_seconds is not None:
-                        until_threshold = (
-                            self.settings.lock_after_seconds
-                            - self.settings.wake_before_seconds
-                            - idle_seconds
-                        )
-                        if until_threshold > 0:
-                            delay = min(delay, max(0.5, until_threshold))
+                    delay = OFF_POLL_SECONDS
+                if self.duration is not None:
+                    delay = min(delay, max(0.01, start + self.duration - self.monotonic()))
                 self.sleep(delay)
         finally:
-            if self.awake_enabled:
-                self.platform.set_keep_awake(False)
-                self.awake_enabled = False
+            if self.awake:
+                self._set_awake(False)
+
+
+# --------------------------------------------------------------------------
+# Dry-run platform and CLI
+# --------------------------------------------------------------------------
+
+
+class DryRunPlatform:
+    """Logs what would happen; never touches Windows. Works on any OS."""
+
+    def __init__(self) -> None:
+        self.tick = 0
+
+    def claim_single_instance(self) -> bool:
+        return True
+
+    def set_awake(self, enabled: bool) -> None:
+        LOG.debug("[dry-run] SetThreadExecutionState(%s)", enabled)
+
+    def lock_timeouts(self):
+        return None, None
+
+    def desktop_ready(self) -> bool:
+        return True
+
+    def user_holding_input(self) -> bool:
+        return False
+
+    def input_state(self) -> Tuple[int, float]:
+        return self.tick, 10**6  # pretend the user is always idle
+
+    def send_activity(self, mode: str) -> bool:
+        LOG.info("[dry-run] would send %s activity", mode)
+        self.tick += 1
+        return True
+
+
+def _arg(parser_fn):
+    def wrapped(text):
+        try:
+            return parser_fn(text)
+        except ValueError as error:
+            raise argparse.ArgumentTypeError(str(error)) from None
+    return wrapped
+
+
+def _seconds(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("must be a positive number of seconds")
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Keep a Windows PC awake during a local-time window with "
-            "minimal, idle-aware input."
+    p = argparse.ArgumentParser(
+        prog="keep_awake.py",
+        description="Keep Windows awake and Teams Available during work hours; "
+                    "let Teams go Away during breaks.",
+        allow_abbrev=False,
+    )
+    p.add_argument("--hours", type=_arg(parse_range), default=parse_range(DEFAULT_HOURS),
+                   metavar="HH:MM-HH:MM", help="work hours (default %s)" % DEFAULT_HOURS)
+    p.add_argument("--break", dest="breaks", type=_arg(parse_range), action="append",
+                   metavar="HH:MM-HH:MM",
+                   help="break when Teams may go Away; repeatable (default %s)"
+                        % ", ".join(DEFAULT_BREAKS))
+    p.add_argument("--no-breaks", action="store_true", help="no breaks at all")
+    p.add_argument("--days", type=_arg(parse_days), default=parse_days(DEFAULT_DAYS),
+                   metavar="DAYS", help="work days, e.g. mon-fri or mon,tue,thu (default mon-fri)")
+    p.add_argument("--holiday", type=_arg(dt.date.fromisoformat), action="append", default=[],
+                   metavar="YYYY-MM-DD", help="day off; repeatable")
+    p.add_argument("--us-holidays", action="store_true",
+                   help="also treat US federal holidays (observed dates) as days off")
+    p.add_argument("--idle", type=_arg(_seconds), default=DEFAULT_IDLE_SECONDS, metavar="SECONDS",
+                   help="send activity only after this much idle time (default %.0f; lowered "
+                        "automatically for shorter lock timeouts)" % DEFAULT_IDLE_SECONDS)
+    p.add_argument("--input", dest="input_mode", choices=("auto", "f24", "mouse", "none"),
+                   default="auto",
+                   help="auto = F24 key, falling back to a 1-pixel mouse nudge (default); "
+                        "none = keep awake only, Teams may go Away")
+    p.add_argument("--sleep-on-breaks", action="store_true",
+                   help="also release the keep-awake request during breaks")
+    p.add_argument("--always-awake", action="store_true",
+                   help="keep the PC awake outside work hours too (no input is sent)")
+    p.add_argument("--duration", type=_arg(_seconds), metavar="SECONDS",
+                   help="stop after this many seconds")
+    p.add_argument("--log-file", metavar="PATH", help="also append log lines to this file")
+    p.add_argument("--dry-run", action="store_true",
+                   help="simulate without Windows calls (any OS) and show the current phase")
+    p.add_argument("--status", action="store_true",
+                   help="print schedule phase and Windows idle/lock info, then exit")
+    p.add_argument("--verbose", action="store_true", help="debug logging")
+    p.add_argument("--version", action="version", version=VERSION)
+    return p
+
+
+def configure_logging(verbose: bool, log_file: Optional[str]) -> None:
+    LOG.handlers.clear()
+    LOG.propagate = False
+    LOG.setLevel(logging.DEBUG if verbose else logging.INFO)
+    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", "%Y-%m-%d %H:%M:%S")
+    handlers = [logging.StreamHandler(sys.stdout)]
+    if log_file:
+        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+    for handler in handlers:
+        handler.setFormatter(fmt)
+        LOG.addHandler(handler)
+
+
+def status(platform, schedule: Schedule, idle_seconds: float) -> None:
+    phase, reason = schedule.phase(dt.datetime.now())
+    saver, machine = platform.lock_timeouts()
+    _, idle = platform.input_state()
+    print("Windows Smart Keep Awake v%s" % VERSION)
+    print("  Now:                  %s (%s)" % (phase.upper(), reason))
+    print("  Session idle:         %.0fs" % idle)
+    print("  Desktop interactive:  %s" % platform.desktop_ready())
+    print("  Screen-saver timeout: %s" % ("%.0fs" % saver if saver else "off"))
+    print("  Policy lock timeout:  %s" % ("%.0fs" % machine if machine else "not set"))
+    print("  Activity threshold:   %.0fs idle" % effective_idle_seconds(idle_seconds,
+                                                                      (saver, machine)))
+
+
+def _interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    configure_logging(args.verbose, args.log_file)
+    breaks = () if args.no_breaks else tuple(
+        args.breaks or (parse_range(b) for b in DEFAULT_BREAKS))
+    schedule = Schedule(args.hours, breaks, args.days, frozenset(args.holiday), args.us_holidays)
+    try:
+        platform = DryRunPlatform() if args.dry_run else WindowsPlatform()
+        if args.status:
+            status(platform, schedule, args.idle)
+            return 0
+        if not platform.claim_single_instance():
+            LOG.error("Already running in another window; close that one first")
+            return 1
+        for name in ("SIGTERM", "SIGBREAK"):
+            if hasattr(signal, name):
+                signal.signal(getattr(signal, name), _interrupt)
+        runner = Runner(
+            platform, schedule,
+            idle_seconds=args.idle,
+            input_mode=args.input_mode,
+            awake_on_breaks=not args.sleep_on_breaks,
+            awake_off_hours=args.always_awake,
+            duration=args.duration if not args.dry_run else (args.duration or 1.0),
         )
-    )
-    parser.add_argument(
-        "--hours",
-        default=DEFAULT_HOURS,
-        metavar="START-END",
-        help="local daily window, default: %(default)s",
-    )
-    parser.add_argument(
-        "--lock-after",
-        default="auto",
-        metavar="SECONDS|auto",
-        help="inactivity timeout; auto-detect or override it explicitly",
-    )
-    parser.add_argument(
-        "--wake-before",
-        type=parse_nonnegative_seconds,
-        default=DEFAULT_WAKE_BEFORE_SECONDS,
-        metavar="SECONDS",
-        help="pulse this many seconds before the timeout, default: %(default)s",
-    )
-    parser.add_argument(
-        "--poll",
-        type=parse_seconds,
-        default=DEFAULT_POLL_SECONDS,
-        metavar="SECONDS",
-        help="maximum idle check interval, default: %(default)s",
-    )
-    parser.add_argument(
-        "--cooldown",
-        type=parse_nonnegative_seconds,
-        default=DEFAULT_COOLDOWN_SECONDS,
-        metavar="SECONDS",
-        help="minimum time between pulses, default: %(default)s",
-    )
-    parser.add_argument(
-        "--input",
-        choices=("f24", "mouse", "none"),
-        default=DEFAULT_INPUT_MODE,
-        help="input pulse: rare F24 key, one-pixel mouse nudge, or none",
-    )
-    parser.add_argument(
-        "--no-sleep-prevention",
-        action="store_true",
-        help="do not call SetThreadExecutionState during the active window",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="log decisions without changing power state or sending input",
-    )
-    parser.add_argument(
-        "--once",
-        action="store_true",
-        help="evaluate one iteration and exit",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="enable informational logging",
-    )
-    parser.add_argument("--version", action="version", version="1.0.0")
-    return parser
-
-
-def configure_logging(verbose: bool) -> None:
-    logging.basicConfig(
-        level=logging.INFO if verbose else logging.WARNING,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-
-def main(argv=None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    configure_logging(args.verbose)
-
-    try:
-        schedule = parse_hours(args.hours)
-        lock_after = parse_lock_after(args.lock_after)
-    except ValueError as error:
-        parser.error(str(error))
-
-    if os.name != "nt":
-        parser.error("this utility must be run on Windows")
-
-    platform = WindowsPlatform()
-    if lock_after is None:
-        lock_after, source = platform.detect_lock_timeout()
-        LOGGER.info("using %.0fs timeout from %s", lock_after, source)
-    else:
-        source = "command-line override"
-        LOGGER.info("using %.0fs timeout from %s", lock_after, source)
-
-    settings = Settings(
-        schedule=schedule,
-        lock_after_seconds=lock_after,
-        wake_before_seconds=args.wake_before,
-        poll_seconds=args.poll,
-        cooldown_seconds=args.cooldown,
-        input_mode=args.input,
-        prevent_sleep=not args.no_sleep_prevention,
-        dry_run=args.dry_run,
-    )
-    LOGGER.info(
-        "active from %s to %s; input=%s; sleep-prevention=%s; dry-run=%s",
-        schedule.start.strftime("%H:%M"),
-        schedule.end.strftime("%H:%M"),
-        settings.input_mode,
-        settings.prevent_sleep and not settings.dry_run,
-        settings.dry_run,
-    )
-
-    runner = KeepAwakeRunner(settings, platform)
-    try:
-        runner.run(once=args.once)
+        return runner.run()
     except KeyboardInterrupt:
-        LOGGER.info("stopped")
+        LOG.info("Stopped")
+        return 0
     except OSError as error:
-        LOGGER.error("Windows API error: %s", error)
+        LOG.error("%s", error)
         return 1
-    return 0
 
 
 if __name__ == "__main__":

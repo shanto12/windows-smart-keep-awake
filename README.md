@@ -1,63 +1,82 @@
 # Windows Smart Keep Awake
 
-A single-file, dependency-free Python utility for Windows that keeps the machine awake during a local-time window while minimizing interference with normal work.
+One small Python file, using only the standard library. It keeps a Windows laptop or VM awake during work hours and keeps Microsoft Teams **Available** while you're away from the keyboard. During lunch it lets Teams go **Away** on its own, and it stays out of your way the rest of the time.
 
-The default behavior is:
+| Time (default)                 | PC sleep / display off | Activity input  | Teams status                         |
+|--------------------------------|------------------------|-----------------|--------------------------------------|
+| Mon–Fri 08:00–12:00, 13:00–18:00 | blocked                | when idle ≥ 2 min | Available                            |
+| Lunch 12:00–13:00              | blocked                | **none**        | goes Away naturally (~5 min idle)    |
+| Evenings, weekends, holidays   | normal Windows settings | none            | whatever Teams decides               |
 
-- active from **08:00 through 18:00 local time**;
-- use Windows APIs to prevent system sleep during that window;
-- read the visible Windows inactivity settings when possible;
-- send one rare **F24 key down/up pair** only when the idle time is within 30 seconds of the detected timeout;
-- check at most every 15 seconds and wait at the schedule boundary when outside the window;
-- never inject input while the user is actively working, because the pulse is only considered after the idle threshold is reached.
+## Quick start (any Windows 10/11 laptop or VM)
 
-## Run it
+1. Install Python 3.9+ if `py --version` doesn't work: `winget install Python.Python.3.12`, or use [python.org](https://www.python.org/downloads/windows/).
+2. Download this repo (green **Code** button → *Download ZIP*) and unzip it anywhere.
+3. Double-click **`KeepAwake.cmd`**. Close the window or press `Ctrl+C` to stop.
 
-On the Windows laptop, with Python 3 installed:
+**Start automatically at sign-in:** press `Win+R`, type `shell:startup`, and put a *shortcut* to `KeepAwake.cmd` in that folder. To minimise the window, open the shortcut's *Properties* and set *Run* to *Minimized*. Only one copy ever runs at a time.
 
-```powershell
-py keep_awake.py
-```
-
-Useful overrides:
+To check what it sees right now, without changing anything:
 
 ```powershell
-# Preview decisions without changing power state or sending input.
-py keep_awake.py --dry-run --verbose
-
-# Use a one-pixel relative mouse nudge instead of F24.
-py keep_awake.py --input mouse
-
-# Set an explicit 15-minute lock timeout and use a 45-second lead.
-py keep_awake.py --lock-after 900 --wake-before 45
-
-# Use a different local-time window.
-py keep_awake.py --hours 07:30-19:00
-
-# Only prevent sleep; do not synthesize keyboard or mouse input.
-py keep_awake.py --input none
+py keep_awake.py --status
 ```
 
-Press `Ctrl+C` to stop. The script clears its Windows power request on exit.
+## Options
 
-## Why it is conservative
+```powershell
+py keep_awake.py --hours 07:30-17:00 --break 12:30-13:30   # custom day
+py keep_awake.py --break 10:30-10:45 --break 12:00-13:00   # several breaks
+py keep_awake.py --no-breaks                                # Available all day
+py keep_awake.py --days mon,tue,thu                         # custom work days
+py keep_awake.py --us-holidays --holiday 2026-12-24         # days off
+py keep_awake.py --input none                               # keep awake only; Teams may go Away
+py keep_awake.py --input mouse                              # use the 1-px mouse nudge only
+py keep_awake.py --always-awake                             # never sleep, even off-hours (no input)
+py keep_awake.py --sleep-on-breaks                          # allow sleep during breaks too
+py keep_awake.py --log-file "%LOCALAPPDATA%\keep_awake.log"
+py keep_awake.py --dry-run                                  # simulate on any OS
+```
 
-The runner is intentionally a single loop with no third-party packages. It uses `GetLastInputInfo` for the real Windows idle duration, monotonic time for cooldowns, and local wall-clock time only for the daily schedule. It sleeps until the next relevant check, so it does not busy-wait.
+To make your options permanent, edit the `set "ARGS=..."` line in `KeepAwake.cmd`. Times are the PC's local time.
 
-F24 is used by default because it is a non-text virtual key and does not move the pointer. Applications can still choose to handle any synthetic input, so `--input mouse` and `--input none` are available. Use this only on a device you own or are authorized to manage, and only where it is consistent with your organization’s security policy. It does not override a centrally enforced lock policy.
+## How it works, and why "awake" and "Teams green" are different
 
-`SetThreadExecutionState` prevents ordinary system sleep while the schedule is active. It does not guarantee that Windows will ignore a managed inactivity lock. Auto-detection covers visible screen-saver and machine inactivity settings; use `--lock-after SECONDS` when your environment has a hidden or centrally managed timeout.
+Windows has two separate timers, so the script uses two mechanisms:
+
+1. **Machine awake (sleep and display timeout).** This uses [`SetThreadExecutionState`](https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-setthreadexecutionstate)`(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)`. It's the documented API that video players, presentation tools and PowerToys Awake use. It sends no input and changes no settings, and Windows drops it automatically when the process exits.
+
+2. **Teams presence and screen lock.** Teams sets you to [Away after about 5 minutes without keyboard or mouse input](https://learn.microsoft.com/microsoftteams/presence-admins), or as soon as the PC locks. It reads the same *last input* idle timer that drives the screen saver and the inactivity lock. **A power request does not reset that timer**, so mechanism 1 alone leaves you Away. During work hours, once you've been idle for 2 minutes, the script sends a single **F24** key tap. F24 isn't on any physical keyboard, so it types nothing, moves nothing and doesn't steal focus. The script then checks with `GetLastInputInfo` that Windows registered the tap. If it didn't (some VMs or remote consoles), it switches to a 1-pixel mouse move that returns to the same spot. If that doesn't register either, it backs off for 5 minutes instead of looping.
+
+During a **break** no input is sent, so Teams goes Away after its normal timeout while the PC itself stays awake. When you come back and touch the keyboard, Teams turns green again right away.
+
+The 2-minute threshold is lowered automatically if your screen saver or policy lock timeout is shorter (to half that timeout, but never below 10 s).
+
+## Designed to be quiet with security tools
+
+Endpoint protection products flag malware-style behaviour. This script doesn't do any of that:
+
+- **No** keyboard or mouse hooks, keylogging, injection into other processes, admin rights, or UAC prompts.
+- **No** registry, policy or power-plan writes. It only *reads* the screen-saver timeout and the `InactivityTimeoutSecs` policy.
+- **No** network access, downloads, services, scheduled tasks, or hidden persistence. Autostart is a shortcut you add yourself.
+- **No** obfuscation or packed executables. It's plain, readable Python run by the standard `python.exe`, and it shows a visible console window.
+- Input is sent only while you're idle, only on the normal unlocked desktop, and never while a key or mouse button is held. It never acts on the lock screen or a UAC prompt.
+
+It doesn't try to hide from or get around security software. If your organisation blocks Python or simulated input by policy, respect that. Use this only on devices and in ways your employer allows.
+
+## Limits
+
+- It can't override a manually set Teams status, a meeting or call status, calendar-based status, or org presence policies.
+- An enforced policy can still lock the screen. Closing the lid, critical battery, Dynamic Lock and a manual `Win+L` still work as usual.
+- **On VMs, RDP and Citrix:** a *minimised* remote window has no interactive desktop, so the script pauses input until the window is restored. Keep the session window open, even behind other windows.
 
 ## Tests
 
-The decision logic and scheduling behavior are testable on any platform:
-
 ```powershell
 python -m unittest discover -s tests -v
-python -m py_compile keep_awake.py tests/test_keep_awake.py
 ```
 
-The actual input and power calls are isolated behind `WindowsPlatform` and are only invoked on Windows.
+The tests fake every Windows call, so they run on any OS. CI runs them on Windows and Ubuntu, and on Windows it also makes a real power request.
 
 ## License
 
