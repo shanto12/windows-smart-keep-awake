@@ -50,14 +50,14 @@ Windows has two separate timers, so the script uses two mechanisms:
 
 During a **break** no input is sent, so Teams goes Away after its normal timeout while the PC itself stays awake. When you come back and touch the keyboard, Teams turns green again right away.
 
-The 2-minute threshold is lowered automatically if your screen saver or policy lock timeout is shorter (to half that timeout, but never below 10 s).
+The 2-minute threshold is lowered automatically when a shorter lock timeout is found (to half of it, but never below 10 s). It checks the screen saver, the `InactivityTimeoutSecs` Group Policy, the Group Policy screen-saver timeout and the Intune/MDM `MaxInactivityTimeDeviceLock` setting.
 
 ## Designed to be quiet with security tools
 
 Endpoint protection products flag malware-style behaviour. This script doesn't do any of that:
 
 - **No** keyboard or mouse hooks, keylogging, injection into other processes, admin rights, or UAC prompts.
-- **No** registry, policy or power-plan writes. It only *reads* the screen-saver timeout and the `InactivityTimeoutSecs` policy.
+- **No** registry, policy or power-plan writes. It only *reads* the screen-saver and lock-timeout settings.
 - **No** network access, downloads, services, scheduled tasks, or hidden persistence. Autostart is a shortcut you add yourself.
 - **No** obfuscation or packed executables. It's plain, readable Python run by the standard `python.exe`, and it shows a visible console window.
 - Input is sent only while you're idle, only on the normal unlocked desktop, and never while a key or mouse button is held. It never acts on the lock screen or a UAC prompt.
@@ -68,6 +68,8 @@ It doesn't try to hide from or get around security software. If your organisatio
 
 - It can't override a manually set Teams status, a meeting or call status, calendar-based status, or org presence policies.
 - An enforced policy can still lock the screen. Closing the lid, critical battery, Dynamic Lock and a manual `Win+L` still work as usual.
+- Run it in the **same Windows session as Teams**. If Teams runs inside a VM or remote desktop, run the script there, not on the host.
+- If an *elevated* (admin) window is in front, Windows blocks simulated input. The script retries instead of spinning.
 - **On VMs, RDP and Citrix:** a *minimised* remote window has no interactive desktop, so the script pauses input until the window is restored. Keep the session window open, even behind other windows.
 
 ## Tests

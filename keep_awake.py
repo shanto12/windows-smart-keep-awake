@@ -195,6 +195,7 @@ SPI_GETSCREENSAVETIMEOUT = 0x000E
 DESKTOP_READOBJECTS = 0x0001
 UOI_NAME, UOI_IO = 2, 6
 ERROR_ALREADY_EXISTS = 183
+ERROR_ACCESS_DENIED = 5
 SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN = 76, 77, 78, 79
 # Shift, Ctrl, Alt, Win (L/R), F24, mouse buttons: never inject while held.
 HELD_KEYS = (0x10, 0x11, 0x12, 0x5B, 0x5C, VK_F24, 0x01, 0x02, 0x04, 0x05, 0x06)
@@ -261,11 +262,23 @@ class WindowsPlatform:
         ):
             fn.argtypes, fn.restype = args, res
         self._mutex = None
+        # Physical-pixel coordinates so the mouse fallback is exact on scaled/mixed-DPI
+        # monitors. Thread-scoped (Win10 1607+), with an older process-wide fallback.
+        try:
+            u32.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+            u32.SetThreadDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+            if not u32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4)):
+                u32.SetProcessDPIAware()
+        except AttributeError:
+            u32.SetProcessDPIAware()
 
     # -- process ----------------------------------------------------------
     def claim_single_instance(self) -> bool:
         self._mutex = self.kernel32.CreateMutexW(None, False, "Local\\WindowsSmartKeepAwake")
-        return not (self._mutex and ctypes.get_last_error() == ERROR_ALREADY_EXISTS)
+        error = ctypes.get_last_error()
+        if not self._mutex:
+            return error != ERROR_ACCESS_DENIED  # owned by an elevated instance
+        return error != ERROR_ALREADY_EXISTS
 
     # -- power ------------------------------------------------------------
     def set_awake(self, enabled: bool) -> None:
@@ -283,27 +296,37 @@ class WindowsPlatform:
         return info.dwTime, elapsed / 1000.0
 
     def lock_timeouts(self) -> Tuple[Optional[float], Optional[float]]:
-        """(screen-saver timeout, machine inactivity lock) in seconds, if set."""
+        """(screen-saver timeout, shortest policy/MDM lock) in seconds, if set. Read-only."""
         def spi(action: int) -> Optional[int]:
             value = DWORD()
             ok = self.user32.SystemParametersInfoW(action, 0, ctypes.byref(value), 0)
             return value.value if ok else None
 
         saver = spi(SPI_GETSCREENSAVETIMEOUT) if spi(SPI_GETSCREENSAVEACTIVE) else None
-        machine = None
-        try:
-            import winreg
+        import winreg
 
-            with winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE,
+        def reg(hive, path, name, scale=1.0) -> Optional[float]:
+            try:
+                with winreg.OpenKey(hive, path, 0,
+                                    winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as key:
+                    value, _ = winreg.QueryValueEx(key, name)
+                value = float(value)
+                return value * scale if value > 0 else None
+            except (OSError, ValueError, TypeError):
+                return None
+
+        policies = [
+            reg(winreg.HKEY_LOCAL_MACHINE,
                 r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
-                0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY,
-            ) as key:
-                value, kind = winreg.QueryValueEx(key, "InactivityTimeoutSecs")
-                if kind == winreg.REG_DWORD and value > 0:
-                    machine = float(value)
-        except OSError:
-            pass
+                "InactivityTimeoutSecs"),
+            reg(winreg.HKEY_LOCAL_MACHINE,  # Intune / MDM, minutes
+                r"SOFTWARE\Microsoft\PolicyManager\current\device\DeviceLock",
+                "MaxInactivityTimeDeviceLock", 60.0),
+            reg(winreg.HKEY_CURRENT_USER,  # Group Policy screen saver, seconds (REG_SZ)
+                r"Software\Policies\Microsoft\Windows\Control Panel\Desktop",
+                "ScreenSaveTimeOut"),
+        ]
+        machine = min((v for v in policies if v), default=None)
         return (float(saver) if saver else None), machine
 
     def desktop_ready(self) -> bool:
@@ -349,7 +372,7 @@ class WindowsPlatform:
             return None
         nudge_x = point.x + (1 if point.x < left + width - 1 else -1)
         events = (INPUT * 2)()
-        # Absolute coordinates: immune to pointer acceleration, so it returns exactly.
+        # Absolute physical coordinates: no pointer acceleration, returns to the same pixel.
         for event, x in zip(events, (nudge_x, point.x)):
             event.type = INPUT_MOUSE
             event.mi.dx = min(65535, int((x - left + 0.5) * 65536 / width))
@@ -428,9 +451,11 @@ class Runner:
             LOG.warning("F24 %s; switching to 1-pixel mouse nudge", why)
             self.mode = "mouse"
             return
-        LOG.warning("%s input %s; retrying in %d min (keep-awake unaffected)",
-                    self.mode, why, RETRY_SECONDS // 60)
-        self._retry_at = clock + RETRY_SECONDS
+        retry = min(RETRY_SECONDS, self.threshold)
+        LOG.warning("%s input %s (an elevated window in front or a minimised remote "
+                    "session can block it); retrying in %.0fs, keep-awake unaffected",
+                    self.mode, why, retry)
+        self._retry_at = clock + retry
         if self.input_mode == "auto":
             self.mode = "f24"  # start the auto sequence again next time
 
@@ -490,6 +515,11 @@ class Runner:
                     last_phase = (phase, reason)
                     self._pending = None
                     self._paused = None
+                    self._retry_at = 0.0
+                    if self.input_mode == "auto":
+                        self.mode = "f24"
+                    self.threshold = effective_idle_seconds(  # pick up policy changes
+                        self.requested_idle, self.platform.lock_timeouts())
                 self._set_awake(phase == WORK or self.awake_off_hours
                                 or (phase == BREAK and self.awake_on_breaks))
                 if phase == WORK and self.input_mode != "none":
@@ -506,7 +536,10 @@ class Runner:
                 self.sleep(delay)
         finally:
             if self.awake:
-                self._set_awake(False)
+                try:
+                    self._set_awake(False)
+                except OSError as error:  # don't mask the original exception
+                    LOG.warning("Could not release keep-awake request: %s", error)
 
 
 # --------------------------------------------------------------------------

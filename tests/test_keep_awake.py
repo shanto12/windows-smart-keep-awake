@@ -208,8 +208,8 @@ class RunnerTests(unittest.TestCase):
 
     def test_backs_off_when_nothing_registers(self):
         _, platform, _ = run(at(9), 1200, registers=())
-        # f24, mouse, then retry every 5 minutes; never a tight loop.
-        self.assertLessEqual(len(platform.sent), 2 * (1 + 1200 // ka.RETRY_SECONDS) + 2)
+        # f24 then mouse per attempt, retried once per idle threshold; never a tight loop.
+        self.assertLessEqual(len(platform.sent), 2 * (1 + 1200 // 120) + 2)
 
     def test_locked_desktop_pauses_activity(self):
         runner, platform, _ = run(at(9), 900, desktop=False)
